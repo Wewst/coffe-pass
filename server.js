@@ -31,14 +31,14 @@ app.get('/api/partners', (req, res) => {
 
 // Запуск сервера СРАЗУ
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(✅ Сервер запущен на порту ${PORT});
-  console.log(🌐 Health: http://0.0.0.0:${PORT}/health);
+  console.log(`✅ Сервер запущен на порту ${PORT}`);
+  console.log(`🌐 Health: http://0.0.0.0:${PORT}/health`);
   
   // Инициализация БД в фоне (после запуска)
   setTimeout(async () => {
     try {
       console.log('🔄 Инициализация БД в фоне...');
-      await pool.query(
+      await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
           id SERIAL PRIMARY KEY,
           telegram_id BIGINT UNIQUE NOT NULL,
@@ -68,7 +68,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
           partner_name VARCHAR(255),
           created_at TIMESTAMP DEFAULT NOW()
         );
-      );
+      `);
       console.log('✅ Таблицы созданы');
     } catch (err) {
       console.log('⚠️ Ошибка БД (но сервер работает):', err.message);
