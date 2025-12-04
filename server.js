@@ -4,7 +4,8 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+// Railway сам назначает порт через переменную PORT
+const PORT = process.env.PORT || 10000; // 10000 стандартный порт Railway
 
 // Middleware
 app.use(cors());
@@ -22,15 +23,14 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// JWT секрет (в Railway добавь переменную JWT_SECRET)
+// JWT секрет
 const JWT_SECRET = process.env.JWT_SECRET || 'coffeepass-secret-key-2025';
 
-// ============ СОЗДАНИЕ ТАБЛИЦ ПРИ ЗАПУСКЕ ============
+// ============ СОЗДАНИЕ ТАБЛИЦ ============
 async function initDatabase() {
   console.log('🔄 Создаем таблицы если нет...');
   
   try {
-    // 1. Таблица пользователей
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -40,10 +40,7 @@ async function initDatabase() {
         last_name VARCHAR(255),
         created_at TIMESTAMP DEFAULT NOW()
       );
-    `);
-    
-    // 2. Таблица подписок
-    await pool.query(`
+      
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
@@ -55,10 +52,7 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
-    `);
-    
-    // 3. Таблица платежей
-    await pool.query(`
+      
       CREATE TABLE IF NOT EXISTS payments (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
@@ -68,10 +62,7 @@ async function initDatabase() {
         status VARCHAR(20) DEFAULT 'completed',
         created_at TIMESTAMP DEFAULT NOW()
       );
-    `);
-    
-    // 4. Таблица кодов
-    await pool.query(`
+      
       CREATE TABLE IF NOT EXISTS codes (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
@@ -81,10 +72,7 @@ async function initDatabase() {
         partner_name VARCHAR(255),
         created_at TIMESTAMP DEFAULT NOW()
       );
-    `);
-    
-    // 5. Таблица партнеров (фиксированная)
-    await pool.query(`
+      
       CREATE TABLE IF NOT EXISTS partners (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL UNIQUE,
@@ -114,7 +102,6 @@ async function initDatabase() {
 
 // ============ API РОУТЫ ============
 
-// 1. Здоровье
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -128,7 +115,6 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// 2. Получить партнеров
 app.get('/api/partners', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM partners WHERE is_active = true');
@@ -138,7 +124,6 @@ app.get('/api/partners', async (req, res) => {
   }
 });
 
-// 3. Авторизация Telegram
 app.post('/api/auth/telegram', async (req, res) => {
   try {
     const { initData } = req.body;
@@ -190,266 +175,32 @@ app.post('/api/auth/telegram', async (req, res) => {
   }
 });
 
-// 4. Получить состояние пользователя
-app.get('/api/user/state', async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
-    
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    
-    const userResult = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [decoded.telegram_id]
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    const user = userResult.rows[0];
-    
-    const subscriptionResult = await pool.query(
-      `SELECT * FROM subscriptions 
-       WHERE user_id = $1 AND is_active = true AND month = $2`,
-      [user.id, currentMonth]
-    );
-    
-    let state = {
-      purchased: false,
-      remaining: 0,
-      month: currentMonth,
-      user: { id: user.id, first_name: user.first_name }
-    };
-    
-    if (subscriptionResult.rows.length > 0) {
-      const sub = subscriptionResult.rows[0];
-      state.purchased = true;
-      state.remaining = sub.cups_remaining;
-      state.subscription = sub;
-    }
-    
-    const partnersResult = await pool.query('SELECT * FROM partners WHERE is_active = true');
-    state.partners = partnersResult.rows;
-    
-    res.json(state);
-    
-  } catch (error) {
-    console.error('❌ Ошибка получения состояния:', error);
-    res.status(500).json({ error: 'Ошибка получения данных' });
-  }
-});
-
-// 5. ПОКУПКА
-app.post('/api/purchase', async (req, res) => {
-  try {
-    const { cups, token } = req.body;
-    if (!token) return res.status(401).json({ error: 'Нет токена' });
-    
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    
-    const userResult = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [decoded.telegram_id]
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    const user = userResult.rows[0];
-    console.log(`💰 Покупка: ${user.first_name} - ${cups} чашек`);
-    
-    const pricePerCup = 167;
-    const totalPrice = Math.round(pricePerCup * cups);
-    
-    const subResult = await pool.query(
-      `SELECT * FROM subscriptions 
-       WHERE user_id = $1 AND is_active = true AND month = $2`,
-      [user.id, currentMonth]
-    );
-    
-    let subscription;
-    let cupsAdded = cups;
-    
-    if (subResult.rows.length > 0) {
-      subscription = subResult.rows[0];
-      const newRemaining = Math.min(subscription.cups_remaining + cups, 12);
-      cupsAdded = newRemaining - subscription.cups_remaining;
-      
-      await pool.query(
-        `UPDATE subscriptions 
-         SET cups_remaining = $1, updated_at = NOW() 
-         WHERE id = $2`,
-        [newRemaining, subscription.id]
-      );
-      
-      subscription.cups_remaining = newRemaining;
-    } else {
-      const newSub = await pool.query(
-        `INSERT INTO subscriptions 
-         (user_id, cups_remaining, price_paid, month) 
-         VALUES ($1, $2, $3, $4) RETURNING *`,
-        [user.id, cups, totalPrice, currentMonth]
-      );
-      subscription = newSub.rows[0];
-    }
-    
-    const paymentResult = await pool.query(
-      `INSERT INTO payments 
-       (user_id, subscription_id, amount, cups_added, status) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [user.id, subscription.id, totalPrice, cupsAdded, 'completed']
-    );
-    
-    console.log(`✅ Платеж сохранен: ID ${paymentResult.rows[0].id}, ${totalPrice}₽`);
-    
-    res.json({
-      success: true,
-      message: `Оплачено ${cupsAdded} чашек`,
-      remaining: subscription.cups_remaining,
-      payment_id: paymentResult.rows[0].id
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка покупки:', error);
-    res.status(500).json({ error: 'Ошибка обработки покупки' });
-  }
-});
-
-// 6. Генерация кода
-app.post('/api/codes/generate', async (req, res) => {
-  try {
-    const { partner_name, token } = req.body;
-    if (!token) return res.status(401).json({ error: 'Нет токена' });
-    
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    const userResult = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [decoded.telegram_id]
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    const user = userResult.rows[0];
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    
-    const subResult = await pool.query(
-      `SELECT cups_remaining FROM subscriptions 
-       WHERE user_id = $1 AND is_active = true AND month = $2`,
-      [user.id, currentMonth]
-    );
-    
-    if (subResult.rows.length === 0 || subResult.rows[0].cups_remaining <= 0) {
-      return res.status(400).json({ error: 'Нет доступных чашек' });
-    }
-    
-    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-    let code;
-    let isUnique = false;
-    
-    while (!isUnique) {
-      code = '';
-      for (let i = 0; i < 6; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
-      }
-      
-      const check = await pool.query('SELECT id FROM codes WHERE code = $1', [code]);
-      isUnique = check.rows.length === 0;
-    }
-    
-    const codeResult = await pool.query(
-      `INSERT INTO codes (user_id, code, partner_name) 
-       VALUES ($1, $2, $3) RETURNING *`,
-      [user.id, code, partner_name]
-    );
-    
-    await pool.query(
-      `UPDATE subscriptions 
-       SET cups_remaining = cups_remaining - 1 
-       WHERE user_id = $1 AND is_active = true AND month = $2`,
-      [user.id, currentMonth]
-    );
-    
-    console.log(`✅ Код сохранен: ${code} для ${user.first_name}`);
-    
-    res.json({
-      success: true,
-      code: { code, id: codeResult.rows[0].id },
-      message: 'Код сгенерирован'
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка генерации кода:', error);
-    res.status(500).json({ error: 'Ошибка генерации кода' });
-  }
-});
-
-// 7. История
-app.get('/api/history', async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
-    
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    const userResult = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [decoded.telegram_id]
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    const user = userResult.rows[0];
-    
-    const codesResult = await pool.query(
-      `SELECT code, is_used, used_at, created_at, partner_name 
-       FROM codes WHERE user_id = $1 ORDER BY created_at DESC`,
-      [user.id]
-    );
-    
-    const paymentsResult = await pool.query(
-      `SELECT amount, cups_added, created_at 
-       FROM payments WHERE user_id = $1 ORDER BY created_at DESC`,
-      [user.id]
-    );
-    
-    res.json({
-      codes: codesResult.rows,
-      payments: paymentsResult.rows
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка получения истории:', error);
-    res.status(500).json({ error: 'Ошибка получения истории' });
-  }
-});
-
-// ============ ЗАПУСК СЕРВЕРА ============
+// Запускаем инициализацию БД и сервер
 async function startServer() {
   try {
     await initDatabase();
     
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Сервер запущен на порту ${PORT}`);
-      console.log(`🔗 Health: /api/health`);
-      console.log(`👥 Партнеры: /api/partners`);
-      console.log(`💰 Все данные сохраняются в PostgreSQL!`);
+      console.log(`✅ Готов к работе!`);
+    });
+    
+    // Добавляем обработку ошибок
+    process.on('SIGTERM', () => {
+      console.log('🛑 Получен SIGTERM, завершаем...');
+      process.exit(0);
+    });
+    
+    process.on('SIGINT', () => {
+      console.log('🛑 Получен SIGINT, завершаем...');
+      process.exit(0);
     });
     
   } catch (error) {
     console.error('❌ Ошибка запуска:', error);
+    process.exit(1);
   }
 }
 
+// ТОЧКА ВХОДА - сразу запускаем
 startServer();
