@@ -1,6 +1,5 @@
 const express = require('express');
 const { Pool } = require('pg');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -47,10 +46,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
-        cups_total INTEGER DEFAULT 12,
         cups_remaining INTEGER DEFAULT 0,
-        is_active BOOLEAN DEFAULT true,
-        price_paid INTEGER DEFAULT 2000,
         month VARCHAR(7),
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -61,7 +57,6 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS payments (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
-        subscription_id INTEGER REFERENCES subscriptions(id),
         amount INTEGER NOT NULL,
         cups_added INTEGER NOT NULL,
         status VARCHAR(20) DEFAULT 'completed',
@@ -75,7 +70,6 @@ async function initDatabase() {
         user_id INTEGER REFERENCES users(id),
         code VARCHAR(20) UNIQUE NOT NULL,
         is_used BOOLEAN DEFAULT false,
-        used_at TIMESTAMP,
         partner_name VARCHAR(255),
         created_at TIMESTAMP DEFAULT NOW()
       );
@@ -108,60 +102,21 @@ async function initDatabase() {
 
 // ============ ПОМОЩНИКИ ============
 
-// Парсим initData от Telegram
-function parseTelegramInitData(initData) {
-  try {
-    console.log('📋 Парсим данные Telegram:', initData.substring(0, 100) + '...');
-    
-    // Разбиваем query string на параметры
-    const params = new URLSearchParams(initData);
-    
-    // Получаем user JSON
-    const userStr = params.get('user');
-    if (!userStr) {
-      throw new Error('No user data in initData');
-    }
-    
-    // Парсим user
-    const user = JSON.parse(decodeURIComponent(userStr));
-    console.log('👤 Парсинг успешен:', user.first_name, user.id);
-    
-    // Также можем проверить подпись (опционально)
-    // Для продакшена нужно проверять через crypto.createHmac('sha256', 'WebAppData')
-    
-    return user;
-    
-  } catch (error) {
-    console.error('❌ Ошибка парсинга Telegram данных:', error);
-    throw error;
-  }
-}
-
-// Генерация JWT токена
+// Генерация простого токена
 function generateToken(userId, telegramId) {
-  const payload = {
-    user_id: userId,
-    telegram_id: telegramId,
-    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7 дней
-  };
-  
-  // Для простоты используем base64
-  const token = Buffer.from(JSON.stringify(payload)).toString('base64');
-  return token;
+  return Buffer.from(`${userId}:${telegramId}:${Date.now()}`).toString('base64');
 }
 
-// Проверка токена
-function verifyToken(token) {
+// Парсинг токена
+function parseToken(token) {
   try {
     const decoded = Buffer.from(token, 'base64').toString();
-    const payload = JSON.parse(decoded);
-    
-    // Проверяем срок действия
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-      return null;
-    }
-    
-    return payload;
+    const parts = decoded.split(':');
+    return {
+      userId: parseInt(parts[0]),
+      telegramId: parseInt(parts[1]),
+      timestamp: parseInt(parts[2])
+    };
   } catch (error) {
     return null;
   }
@@ -197,96 +152,134 @@ app.get('/api/partners', async (req, res) => {
   }
 });
 
-// 3. АВТОРИЗАЦИЯ TELEGRAM (ИСПРАВЛЕННАЯ)
+// 3. АВТОРИЗАЦИЯ TELEGRAM - ФИКСИРОВАННАЯ!
 app.post('/api/auth/telegram', async (req, res) => {
   try {
-    console.log('🔑 Получен запрос на авторизацию');
+    console.log('🔑 Запрос авторизации от Telegram');
     
     const { initData } = req.body;
     
     if (!initData) {
-      return res.status(400).json({ error: 'Нет данных от Telegram' });
+      console.log('❌ Нет initData в запросе');
+      return res.status(400).json({ 
+        success: false,
+        error: 'Нет данных от Telegram' 
+      });
     }
     
-    let telegramUser;
+    console.log('📱 Получены данные Telegram (первые 200 символов):', initData.substring(0, 200));
+    
+    // ПАРСИМ ДАННЫЕ TELEGRAM ПРАВИЛЬНО!
+    let telegramUser = null;
     
     try {
-      // Парсим данные из Telegram
-      telegramUser = parseTelegramInitData(initData);
-      console.log('✅ Telegram данные получены:', {
-        id: telegramUser.id,
-        name: telegramUser.first_name,
-        username: telegramUser.username
-      });
+      // Пробуем разные форматы данных от Telegram
+      
+      // 1. Если это query string от Telegram WebApp
+      if (initData.includes('user=')) {
+        const params = new URLSearchParams(initData);
+        const userStr = params.get('user');
+        if (userStr) {
+          telegramUser = JSON.parse(decodeURIComponent(userStr));
+          console.log('✅ Пользователь из query string:', telegramUser);
+        }
+      }
+      // 2. Если фронтенд уже распарсил и отправил объект
+      else if (initData.id && initData.first_name) {
+        telegramUser = initData;
+        console.log('✅ Пользователь из объекта:', telegramUser);
+      }
+      // 3. Если это JSON строка
+      else if (initData.startsWith('{')) {
+        try {
+          telegramUser = JSON.parse(initData);
+          console.log('✅ Пользователь из JSON строки:', telegramUser);
+        } catch (e) {
+          console.log('❌ Не удалось распарсить как JSON:', e.message);
+        }
+      }
     } catch (parseError) {
-      console.error('❌ Ошибка парсинга Telegram данных:', parseError);
-      return res.status(400).json({ 
+      console.error('❌ Ошибка парсинга данных Telegram:', parseError);
+    }
+    
+    // Если не получили данные пользователя
+    if (!telegramUser || !telegramUser.id) {
+      console.log('⚠️ Не удалось получить данные пользователя из Telegram');
+      console.log('📋 Сырые данные:', initData);
+      return res.status(400).json({
         success: false,
         error: 'Неверные данные Telegram'
       });
     }
     
-    // Проверяем обязательные поля
-    if (!telegramUser.id || !telegramUser.first_name) {
-      return res.status(400).json({
-        success: false,
-        error: 'Отсутствуют обязательные данные пользователя'
-      });
-    }
+    console.log(`👤 Telegram User ID: ${telegramUser.id}, Name: ${telegramUser.first_name}`);
     
-    // Находим или создаем пользователя в БД
+    // НАХОДИМ ИЛИ СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ В БАЗЕ
     let user;
-    const existingUser = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [telegramUser.id]
-    );
     
-    if (existingUser.rows.length > 0) {
-      user = existingUser.rows[0];
-      console.log(`👋 Найден существующий пользователь: ${user.first_name} (ID: ${user.id})`);
-      
-      // Обновляем информацию о пользователе (если изменилась)
-      await pool.query(
-        `UPDATE users 
-         SET username = $1, first_name = $2, last_name = $3 
-         WHERE telegram_id = $4`,
-        [
-          telegramUser.username || user.username,
-          telegramUser.first_name || user.first_name,
-          telegramUser.last_name || user.last_name,
-          telegramUser.id
-        ]
+    try {
+      // Ищем пользователя по telegram_id
+      const existingUser = await pool.query(
+        'SELECT * FROM users WHERE telegram_id = $1',
+        [telegramUser.id]
       );
       
-    } else {
-      // СОЗДАЕМ НОВОГО ПОЛЬЗОВАТЕЛЯ!
-      const newUser = await pool.query(
-        `INSERT INTO users (telegram_id, username, first_name, last_name, language_code) 
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [
-          telegramUser.id,
-          telegramUser.username || '',
-          telegramUser.first_name,
-          telegramUser.last_name || '',
-          telegramUser.language_code || 'ru'
-        ]
-      );
-      user = newUser.rows[0];
-      console.log(`✅ СОЗДАН НОВЫЙ ПОЛЬЗОВАТЕЛЬ: ${user.first_name} (Telegram ID: ${user.telegram_id})`);
-      
-      // Создаем начальную подписку (пустую)
-      const currentMonth = new Date().toISOString().slice(0, 7);
-      await pool.query(
-        `INSERT INTO subscriptions (user_id, cups_remaining, month) 
-         VALUES ($1, $2, $3)`,
-        [user.id, 0, currentMonth]
-      );
-      console.log(`📅 Создана подписка на месяц ${currentMonth}`);
+      if (existingUser.rows.length > 0) {
+        user = existingUser.rows[0];
+        console.log(`👋 Найден существующий пользователь: ${user.first_name} (ID: ${user.id})`);
+        
+        // Обновляем информацию о пользователе
+        await pool.query(
+          `UPDATE users SET 
+           username = $1, 
+           first_name = $2, 
+           last_name = $3,
+           language_code = $4
+           WHERE id = $5`,
+          [
+            telegramUser.username || user.username,
+            telegramUser.first_name || user.first_name,
+            telegramUser.last_name || user.last_name,
+            telegramUser.language_code || user.language_code || 'ru',
+            user.id
+          ]
+        );
+      } else {
+        // СОЗДАЕМ НОВОГО ПОЛЬЗОВАТЕЛЯ!
+        const newUser = await pool.query(
+          `INSERT INTO users (telegram_id, username, first_name, last_name, language_code) 
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [
+            telegramUser.id,
+            telegramUser.username || '',
+            telegramUser.first_name,
+            telegramUser.last_name || '',
+            telegramUser.language_code || 'ru'
+          ]
+        );
+        user = newUser.rows[0];
+        console.log(`🎉 СОЗДАН НОВЫЙ ПОЛЬЗОВАТЕЛЬ: ${user.first_name} (Telegram ID: ${user.telegram_id})`);
+        
+        // Создаем начальную подписку
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        await pool.query(
+          `INSERT INTO subscriptions (user_id, cups_remaining, month) 
+           VALUES ($1, $2, $3)`,
+          [user.id, 0, currentMonth]
+        );
+      }
+    } catch (dbError) {
+      console.error('❌ Ошибка работы с базой данных:', dbError);
+      return res.status(500).json({
+        success: false,
+        error: 'Ошибка работы с базой данных'
+      });
     }
     
     // Генерируем токен
     const token = generateToken(user.id, user.telegram_id);
     
+    // Возвращаем успешный ответ
     res.json({
       success: true,
       token: token,
@@ -299,6 +292,8 @@ app.post('/api/auth/telegram', async (req, res) => {
       }
     });
     
+    console.log(`✅ Авторизация успешна для пользователя: ${user.first_name}`);
+    
   } catch (error) {
     console.error('❌ Ошибка авторизации:', error);
     res.status(500).json({ 
@@ -308,7 +303,7 @@ app.post('/api/auth/telegram', async (req, res) => {
   }
 });
 
-// 4. ПОЛУЧИТЬ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ (ИСПРАВЛЕННОЕ)
+// 4. ПОЛУЧИТЬ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ
 app.get('/api/user/state', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -317,13 +312,13 @@ app.get('/api/user/state', async (req, res) => {
     }
     
     const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
+    const payload = parseToken(token);
     
     if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+      return res.status(401).json({ error: 'Неверный токен' });
     }
     
-    const userId = payload.user_id;
+    const userId = payload.userId;
     const currentMonth = new Date().toISOString().slice(0, 7);
     
     // Получаем пользователя
@@ -338,7 +333,7 @@ app.get('/api/user/state', async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Находим подписку текущего месяца (или создаем пустую)
+    // Находим подписку текущего месяца
     let subscriptionResult = await pool.query(
       `SELECT * FROM subscriptions 
        WHERE user_id = $1 AND month = $2`,
@@ -352,8 +347,6 @@ app.get('/api/user/state', async (req, res) => {
          VALUES ($1, $2, $3)`,
         [user.id, 0, currentMonth]
       );
-      
-      // Получаем созданную подписку
       subscriptionResult = await pool.query(
         `SELECT * FROM subscriptions 
          WHERE user_id = $1 AND month = $2`,
@@ -366,7 +359,7 @@ app.get('/api/user/state', async (req, res) => {
     // Получаем партнеров
     const partnersResult = await pool.query('SELECT * FROM partners WHERE is_active = true');
     
-    // Получаем историю кодов пользователя (последние 20)
+    // Получаем историю кодов пользователя
     const codesResult = await pool.query(
       `SELECT * FROM codes 
        WHERE user_id = $1 
@@ -411,7 +404,7 @@ app.get('/api/user/state', async (req, res) => {
   }
 });
 
-// 5. ПОКУПКА (ИСПРАВЛЕННАЯ)
+// 5. ПОКУПКА
 app.post('/api/purchase', async (req, res) => {
   try {
     const { cups } = req.body;
@@ -422,13 +415,13 @@ app.post('/api/purchase', async (req, res) => {
     }
     
     const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
+    const payload = parseToken(token);
     
     if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+      return res.status(401).json({ error: 'Неверный токен' });
     }
     
-    const userId = payload.user_id;
+    const userId = payload.userId;
     
     if (!cups || cups <= 0) {
       return res.status(400).json({ error: 'Неверное количество чашек' });
@@ -440,60 +433,38 @@ app.post('/api/purchase', async (req, res) => {
     const pricePerCup = 167;
     const totalPrice = Math.round(pricePerCup * cups);
     
-    // Получаем текущую подписку
-    const subscriptionResult = await pool.query(
-      `SELECT * FROM subscriptions 
+    // Обновляем подписку
+    await pool.query(
+      `UPDATE subscriptions 
+       SET cups_remaining = cups_remaining + $1, 
+           updated_at = NOW()
+       WHERE user_id = $2 AND month = $3`,
+      [cups, userId, currentMonth]
+    );
+    
+    // Получаем обновленное количество чашек
+    const updatedSubscription = await pool.query(
+      `SELECT cups_remaining FROM subscriptions 
        WHERE user_id = $1 AND month = $2`,
       [userId, currentMonth]
     );
     
-    let subscriptionId;
-    let newRemaining;
-    
-    if (subscriptionResult.rows.length > 0) {
-      const subscription = subscriptionResult.rows[0];
-      subscriptionId = subscription.id;
-      newRemaining = subscription.cups_remaining + cups;
-      
-      // Обновляем существующую подписку
-      await pool.query(
-        `UPDATE subscriptions 
-         SET cups_remaining = $1, 
-             updated_at = NOW(),
-             is_active = true
-         WHERE id = $2`,
-        [newRemaining, subscriptionId]
-      );
-    } else {
-      // Создаем новую подписку
-      const newSubscription = await pool.query(
-        `INSERT INTO subscriptions (user_id, cups_remaining, month, is_active) 
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [userId, cups, currentMonth, true]
-      );
-      subscriptionId = newSubscription.rows[0].id;
-      newRemaining = cups;
-    }
+    const newRemaining = updatedSubscription.rows[0].cups_remaining;
     
     // СОХРАНЯЕМ ПЛАТЕЖ В БАЗУ
     const paymentResult = await pool.query(
-      `INSERT INTO payments (user_id, subscription_id, amount, cups_added, status) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [userId, subscriptionId, totalPrice, cups, 'completed']
+      `INSERT INTO payments (user_id, amount, cups_added, status) 
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [userId, totalPrice, cups, 'completed']
     );
     
-    console.log(`✅ Покупка успешна. Платеж ID: ${paymentResult.rows[0].id}`);
+    console.log(`✅ Покупка успешна. Осталось чашек: ${newRemaining}`);
     
     res.json({
       success: true,
       message: `Оплачено ${cups} чашек`,
       remaining: newRemaining,
-      payment_id: paymentResult.rows[0].id,
-      subscription: {
-        id: subscriptionId,
-        cups_remaining: newRemaining,
-        month: currentMonth
-      }
+      payment_id: paymentResult.rows[0].id
     });
     
   } catch (error) {
@@ -502,7 +473,7 @@ app.post('/api/purchase', async (req, res) => {
   }
 });
 
-// 6. Генерация кода (ИСПРАВЛЕННАЯ)
+// 6. Генерация кода
 app.post('/api/codes/generate', async (req, res) => {
   try {
     const { partner_name } = req.body;
@@ -513,13 +484,13 @@ app.post('/api/codes/generate', async (req, res) => {
     }
     
     const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
+    const payload = parseToken(token);
     
     if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+      return res.status(401).json({ error: 'Неверный токен' });
     }
     
-    const userId = payload.user_id;
+    const userId = payload.userId;
     const currentMonth = new Date().toISOString().slice(0, 7);
     
     // Проверяем, есть ли у пользователя чашки
@@ -596,13 +567,13 @@ app.get('/api/history', async (req, res) => {
     }
     
     const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
+    const payload = parseToken(token);
     
     if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+      return res.status(401).json({ error: 'Неверный токен' });
     }
     
-    const userId = payload.user_id;
+    const userId = payload.userId;
     
     // Получаем коды
     const codesResult = await pool.query(
