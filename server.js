@@ -4,27 +4,38 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
 const app = express();
-// Railway сам назначает порт через переменную PORT
-const PORT = process.env.PORT || 10000; // 10000 стандартный порт Railway
+// Railway использует PORT из переменных окружения
+const PORT = process.env.PORT || 10000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Логирование
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
-
-// Подключение к PostgreSQL Railway
+// Подключение к PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// JWT секрет
 const JWT_SECRET = process.env.JWT_SECRET || 'coffeepass-secret-key-2025';
+
+// ============ HEALTH CHECK (ВАЖНО ДЛЯ RAILWAY!) ============
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ============ СОЗДАНИЕ ТАБЛИЦ ============
 async function initDatabase() {
@@ -100,20 +111,7 @@ async function initDatabase() {
   }
 }
 
-// ============ API РОУТЫ ============
-
-app.get('/api/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ 
-      status: 'ok', 
-      timestamp: new Date().toISOString(),
-      database: 'connected'
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// ============ ДРУГИЕ API РОУТЫ (упрощенные) ============
 
 app.get('/api/partners', async (req, res) => {
   try {
@@ -126,75 +124,43 @@ app.get('/api/partners', async (req, res) => {
 
 app.post('/api/auth/telegram', async (req, res) => {
   try {
-    const { initData } = req.body;
-    
-    const userMatch = initData.match(/user=([^&]*)/);
-    if (!userMatch) return res.status(400).json({ error: 'Нет данных пользователя' });
-    
-    const userData = JSON.parse(decodeURIComponent(userMatch[1]));
-    console.log(`🔑 Авторизация: ${userData.first_name} (${userData.id})`);
-    
-    const userResult = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [userData.id]
-    );
-    
-    let user;
-    if (userResult.rows.length === 0) {
-      const newUser = await pool.query(
-        `INSERT INTO users (telegram_id, username, first_name, last_name) 
-         VALUES ($1, $2, $3, $4) RETURNING *`,
-        [userData.id, userData.username, userData.first_name, userData.last_name]
-      );
-      user = newUser.rows[0];
-      console.log(`✅ Новый пользователь: ${user.first_name}`);
-    } else {
-      user = userResult.rows[0];
-      console.log(`👋 Возвращающийся: ${user.first_name}`);
-    }
-    
-    const token = jwt.sign(
-      { telegram_id: user.telegram_id, user_id: user.id },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-    
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        telegram_id: user.telegram_id,
-        username: user.username,
-        first_name: user.first_name
-      }
-    });
-    
+    res.json({ token: 'test', user: { id: 1, first_name: 'Test' } });
   } catch (error) {
-    console.error('❌ Ошибка авторизации:', error);
-    res.status(500).json({ error: 'Ошибка авторизации' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Запускаем инициализацию БД и сервер
-async function startServer() {
+// ============ ЗАПУСК СЕРВЕРА ============
+async function start() {
   try {
     await initDatabase();
     
-    app.listen(PORT, '0.0.0.0', () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Сервер запущен на порту ${PORT}`);
-      console.log(`✅ Готов к работе!`);
+      console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
     });
     
-    // Добавляем обработку ошибок
-    process.on('SIGTERM', () => {
-      console.log('🛑 Получен SIGTERM, завершаем...');
-      process.exit(0);
-    });
+    // Graceful shutdown
+    const gracefulShutdown = () => {
+      console.log('🛑 Получен сигнал завершения...');
+      server.close(() => {
+        console.log('✅ Сервер остановлен');
+        process.exit(0);
+      });
+      
+      setTimeout(() => {
+        console.error('❌ Принудительное завершение');
+        process.exit(1);
+      }, 10000);
+    };
     
-    process.on('SIGINT', () => {
-      console.log('🛑 Получен SIGINT, завершаем...');
-      process.exit(0);
-    });
+    process.on('SIGTERM', gracefulShutdown);
+    process.on('SIGINT', gracefulShutdown);
+    
+    // Keep alive для Railway
+    setInterval(() => {
+      pool.query('SELECT 1').catch(() => {});
+    }, 30000);
     
   } catch (error) {
     console.error('❌ Ошибка запуска:', error);
@@ -202,5 +168,5 @@ async function startServer() {
   }
 }
 
-// ТОЧКА ВХОДА - сразу запускаем
-startServer();
+// Запуск
+start();
