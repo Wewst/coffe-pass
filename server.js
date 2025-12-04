@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -22,6 +21,9 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+// JWT секрет (в Railway добавь переменную JWT_SECRET)
+const JWT_SECRET = process.env.JWT_SECRET || 'coffeepass-secret-key-2025';
 
 // ============ СОЗДАНИЕ ТАБЛИЦ ПРИ ЗАПУСКЕ ============
 async function initDatabase() {
@@ -92,7 +94,6 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       
-      -- ВСТАВЛЯЕМ ПАРТНЕРОВ ПРИ ПЕРВОМ ЗАПУСКЕ
       INSERT INTO partners (name, description, address) VALUES
         ('Кофейня на Набережной', 'Уют у Камской набережной', 'ул. Набережная, 12'),
         ('Teatral Coffee', 'Рядом с театром', 'ул. Театральная, 5'),
@@ -103,7 +104,6 @@ async function initDatabase() {
     
     console.log('✅ Все таблицы готовы');
     
-    // Проверяем партнеров
     const partnersResult = await pool.query('SELECT COUNT(*) FROM partners');
     console.log(`📊 Партнеров в базе: ${partnersResult.rows[0].count}`);
     
@@ -143,16 +143,12 @@ app.post('/api/auth/telegram', async (req, res) => {
   try {
     const { initData } = req.body;
     
-    // Парсим данные Telegram (упрощенно)
     const userMatch = initData.match(/user=([^&]*)/);
-    if (!userMatch) {
-      return res.status(400).json({ error: 'Нет данных пользователя' });
-    }
+    if (!userMatch) return res.status(400).json({ error: 'Нет данных пользователя' });
     
     const userData = JSON.parse(decodeURIComponent(userMatch[1]));
     console.log(`🔑 Авторизация: ${userData.first_name} (${userData.id})`);
     
-    // Находим или создаем пользователя
     const userResult = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
       [userData.id]
@@ -160,7 +156,6 @@ app.post('/api/auth/telegram', async (req, res) => {
     
     let user;
     if (userResult.rows.length === 0) {
-      // Создаем нового
       const newUser = await pool.query(
         `INSERT INTO users (telegram_id, username, first_name, last_name) 
          VALUES ($1, $2, $3, $4) RETURNING *`,
@@ -173,10 +168,9 @@ app.post('/api/auth/telegram', async (req, res) => {
       console.log(`👋 Возвращающийся: ${user.first_name}`);
     }
     
-    // Создаем JWT токен
     const token = jwt.sign(
       { telegram_id: user.telegram_id, user_id: user.id },
-      process.env.JWT_SECRET || 'coffeepass-secret-2025',
+      JWT_SECRET,
       { expiresIn: '30d' }
     );
     
@@ -203,11 +197,10 @@ app.get('/api/user/state', async (req, res) => {
     if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
     
     const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'coffeepass-secret-2025');
+    const decoded = jwt.verify(token, JWT_SECRET);
     
-    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
+    const currentMonth = new Date().toISOString().slice(0, 7);
     
-    // Находим пользователя
     const userResult = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
       [decoded.telegram_id]
@@ -219,7 +212,6 @@ app.get('/api/user/state', async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Находим активную подписку
     const subscriptionResult = await pool.query(
       `SELECT * FROM subscriptions 
        WHERE user_id = $1 AND is_active = true AND month = $2`,
@@ -240,7 +232,6 @@ app.get('/api/user/state', async (req, res) => {
       state.subscription = sub;
     }
     
-    // Получаем партнеров
     const partnersResult = await pool.query('SELECT * FROM partners WHERE is_active = true');
     state.partners = partnersResult.rows;
     
@@ -252,16 +243,15 @@ app.get('/api/user/state', async (req, res) => {
   }
 });
 
-// 5. ПОКУПКА (СОХРАНЕНИЕ В БАЗУ!)
+// 5. ПОКУПКА
 app.post('/api/purchase', async (req, res) => {
   try {
     const { cups, token } = req.body;
     if (!token) return res.status(401).json({ error: 'Нет токена' });
     
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'coffeepass-secret-2025');
+    const decoded = jwt.verify(token, JWT_SECRET);
     const currentMonth = new Date().toISOString().slice(0, 7);
     
-    // Находим пользователя
     const userResult = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
       [decoded.telegram_id]
@@ -274,11 +264,9 @@ app.post('/api/purchase', async (req, res) => {
     const user = userResult.rows[0];
     console.log(`💰 Покупка: ${user.first_name} - ${cups} чашек`);
     
-    // Цена
     const pricePerCup = 167;
     const totalPrice = Math.round(pricePerCup * cups);
     
-    // Проверяем существующую подписку
     const subResult = await pool.query(
       `SELECT * FROM subscriptions 
        WHERE user_id = $1 AND is_active = true AND month = $2`,
@@ -289,7 +277,6 @@ app.post('/api/purchase', async (req, res) => {
     let cupsAdded = cups;
     
     if (subResult.rows.length > 0) {
-      // Обновляем существующую
       subscription = subResult.rows[0];
       const newRemaining = Math.min(subscription.cups_remaining + cups, 12);
       cupsAdded = newRemaining - subscription.cups_remaining;
@@ -303,7 +290,6 @@ app.post('/api/purchase', async (req, res) => {
       
       subscription.cups_remaining = newRemaining;
     } else {
-      // Создаем новую
       const newSub = await pool.query(
         `INSERT INTO subscriptions 
          (user_id, cups_remaining, price_paid, month) 
@@ -313,7 +299,6 @@ app.post('/api/purchase', async (req, res) => {
       subscription = newSub.rows[0];
     }
     
-    // СОХРАНЯЕМ ПЛАТЕЖ В БАЗУ!
     const paymentResult = await pool.query(
       `INSERT INTO payments 
        (user_id, subscription_id, amount, cups_added, status) 
@@ -336,15 +321,14 @@ app.post('/api/purchase', async (req, res) => {
   }
 });
 
-// 6. Генерация кода (СОХРАНЕНИЕ В БАЗУ!)
+// 6. Генерация кода
 app.post('/api/codes/generate', async (req, res) => {
   try {
     const { partner_name, token } = req.body;
     if (!token) return res.status(401).json({ error: 'Нет токена' });
     
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'coffeepass-secret-2025');
+    const decoded = jwt.verify(token, JWT_SECRET);
     
-    // Находим пользователя
     const userResult = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
       [decoded.telegram_id]
@@ -357,7 +341,6 @@ app.post('/api/codes/generate', async (req, res) => {
     const user = userResult.rows[0];
     const currentMonth = new Date().toISOString().slice(0, 7);
     
-    // Проверяем остаток чашек
     const subResult = await pool.query(
       `SELECT cups_remaining FROM subscriptions 
        WHERE user_id = $1 AND is_active = true AND month = $2`,
@@ -368,7 +351,6 @@ app.post('/api/codes/generate', async (req, res) => {
       return res.status(400).json({ error: 'Нет доступных чашек' });
     }
     
-    // Генерируем код
     const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
     let code;
     let isUnique = false;
@@ -383,14 +365,12 @@ app.post('/api/codes/generate', async (req, res) => {
       isUnique = check.rows.length === 0;
     }
     
-    // СОХРАНЯЕМ КОД В БАЗУ!
     const codeResult = await pool.query(
       `INSERT INTO codes (user_id, code, partner_name) 
        VALUES ($1, $2, $3) RETURNING *`,
       [user.id, code, partner_name]
     );
     
-    // Уменьшаем счетчик
     await pool.query(
       `UPDATE subscriptions 
        SET cups_remaining = cups_remaining - 1 
@@ -412,16 +392,15 @@ app.post('/api/codes/generate', async (req, res) => {
   }
 });
 
-// 7. История (ВСЕ ДАННЫЕ ИЗ БАЗЫ!)
+// 7. История
 app.get('/api/history', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
     
     const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'coffeepass-secret-2025');
+    const decoded = jwt.verify(token, JWT_SECRET);
     
-    // Находим пользователя
     const userResult = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
       [decoded.telegram_id]
@@ -433,14 +412,12 @@ app.get('/api/history', async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Получаем историю кодов ИЗ БАЗЫ
     const codesResult = await pool.query(
       `SELECT code, is_used, used_at, created_at, partner_name 
        FROM codes WHERE user_id = $1 ORDER BY created_at DESC`,
       [user.id]
     );
     
-    // Получаем историю платежей ИЗ БАЗЫ
     const paymentsResult = await pool.query(
       `SELECT amount, cups_added, created_at 
        FROM payments WHERE user_id = $1 ORDER BY created_at DESC`,
@@ -461,15 +438,13 @@ app.get('/api/history', async (req, res) => {
 // ============ ЗАПУСК СЕРВЕРА ============
 async function startServer() {
   try {
-    // Инициализируем базу
     await initDatabase();
     
-    // Запускаем сервер
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Сервер запущен на порту ${PORT}`);
       console.log(`🔗 Health: /api/health`);
       console.log(`👥 Партнеры: /api/partners`);
-      console.log(`💰 Все платежи и коды СОХРАНЯЮТСЯ в PostgreSQL!`);
+      console.log(`💰 Все данные сохраняются в PostgreSQL!`);
     });
     
   } catch (error) {
