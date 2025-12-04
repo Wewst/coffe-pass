@@ -1,662 +1,1002 @@
-const express = require('express');
-const { Pool } = require('pg');
-const crypto = require('crypto');
-
-const app = express();
-const PORT = process.env.PORT || 10000;
-
-// Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// CORS
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-// Подключаемся к БД
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-console.log('✅ Подключение к PostgreSQL...');
-
-// ============ СОЗДАНИЕ ТАБЛИЦ ============
-async function initDatabase() {
-  try {
-    console.log('🔄 Создаем таблицы...');
-    
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE NOT NULL,
-        username VARCHAR(255),
-        first_name VARCHAR(255) NOT NULL,
-        last_name VARCHAR(255),
-        language_code VARCHAR(10),
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS subscriptions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
-        cups_total INTEGER DEFAULT 12,
-        cups_remaining INTEGER DEFAULT 0,
-        is_active BOOLEAN DEFAULT true,
-        price_paid INTEGER DEFAULT 2000,
-        month VARCHAR(7),
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS payments (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
-        subscription_id INTEGER REFERENCES subscriptions(id),
-        amount INTEGER NOT NULL,
-        cups_added INTEGER NOT NULL,
-        status VARCHAR(20) DEFAULT 'completed',
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS codes (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
-        code VARCHAR(20) UNIQUE NOT NULL,
-        is_used BOOLEAN DEFAULT false,
-        used_at TIMESTAMP,
-        partner_name VARCHAR(255),
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS partners (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL UNIQUE,
-        description TEXT,
-        address VARCHAR(500),
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-      
-      INSERT INTO partners (name, description, address) VALUES
-        ('Кофейня на Набережной', 'Уют у Камской набережной', 'ул. Набережная, 12'),
-        ('Teatral Coffee', 'Рядом с театром', 'ул. Театральная, 5'),
-        ('Горка Кофе', 'Терраса у памятника', 'пл. Ворота, 1'),
-        ('Кофе и Пермь', 'Классика в центре', 'ул. Ленина, 44')
-      ON CONFLICT (name) DO NOTHING;
-    `);
-    
-    console.log('✅ Все таблицы созданы');
-    
-  } catch (error) {
-    console.error('❌ Ошибка создания таблиц:', error.message);
-  }
-}
-
-// ============ ПОМОЩНИКИ ============
-
-// Парсим initData от Telegram
-function parseTelegramInitData(initData) {
-  try {
-    console.log('📋 Парсим данные Telegram:', initData.substring(0, 100) + '...');
-    
-    // Разбиваем query string на параметры
-    const params = new URLSearchParams(initData);
-    
-    // Получаем user JSON
-    const userStr = params.get('user');
-    if (!userStr) {
-      throw new Error('No user data in initData');
-    }
-    
-    // Парсим user
-    const user = JSON.parse(decodeURIComponent(userStr));
-    console.log('👤 Парсинг успешен:', user.first_name, user.id);
-    
-    // Также можем проверить подпись (опционально)
-    // Для продакшена нужно проверять через crypto.createHmac('sha256', 'WebAppData')
-    
-    return user;
-    
-  } catch (error) {
-    console.error('❌ Ошибка парсинга Telegram данных:', error);
-    throw error;
-  }
-}
-
-// Генерация JWT токена
-function generateToken(userId, telegramId) {
-  const payload = {
-    user_id: userId,
-    telegram_id: telegramId,
-    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7 дней
+<script>
+(function(){
+  'use strict';
+  
+  // ============ DOM SELECTORS ============
+  const $ = s => document.querySelector(s);
+  
+  const fx = $('#fx');
+  const splash = $('#splash');
+  const splashLogo = $('#splashLogo');
+  const partnersBtn = $('#partnersBtn');
+  const partnersList = $('#partnersList');
+  const partnersPanel = partnersList ? partnersList.querySelector('.panel') : null;
+  const historyBtn = $('#historyBtn');
+  const buyBtn = $('#buyBtn');
+  const prePurchaseArea = $('#prePurchaseArea');
+  const postPurchaseArea = $('#postPurchaseArea');
+  const usedArea = $('#usedArea');
+  const cupCountEl = $('#cupCount');
+  const openCodeBtn = $('#openCodeBtn');
+  const cupSvg = $('#cupSvg');
+  const returnPurchaseBtn = $('#returnPurchaseBtn');
+  const buyAgainBtn = $('#buyAgainBtn');
+  
+  const overlay = $('#overlay');
+  const popup = $('#popup');
+  const popupContent = $('#popupContent');
+  const popupActions = $('#popupActions');
+  const popupClose = $('#popupClose');
+  
+  // ============ CONFIGURATION ============
+  const API_BASE_URL = 'https://coffeepass-production.up.railway.app';
+  const MAX_CUPS = 12;
+  const SUBSCRIPTION_PRICE = 2000;
+  
+  // State
+  let state = {
+    purchased: false,
+    remaining: 0,
+    month: null,
+    subscription: null,
+    partners: []
   };
   
-  // Для простоты используем base64
-  const token = Buffer.from(JSON.stringify(payload)).toString('base64');
-  return token;
-}
-
-// Проверка токена
-function verifyToken(token) {
-  try {
-    const decoded = Buffer.from(token, 'base64').toString();
-    const payload = JSON.parse(decoded);
-    
-    // Проверяем срок действия
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-      return null;
+  let user = null;
+  let token = null;
+  let tg = window.Telegram?.WebApp;
+  
+  // ============ VISUAL EFFECTS ============
+  
+  function createBeans() {
+    for(let i = 0; i < 9; i++) {
+      const b = document.createElement('div');
+      b.className = 'bean';
+      const left = Math.random() * 100;
+      const dur = 8000 + Math.random() * 12000;
+      b.style.left = left + 'vw';
+      b.style.width = (10 + Math.random() * 24) + 'px';
+      b.style.height = (8 + Math.random() * 16) + 'px';
+      b.style.background = 'rgba(255,255,255,' + (0.04 + Math.random() * 0.1) + ')';
+      b.style.borderRadius = (8 + Math.random() * 10) + 'px / 6px';
+      b.style.animationDuration = dur + 'ms';
+      b.style.animationDelay = (-Math.random() * dur) + 'ms';
+      b.style.animationTimingFunction = 'cubic-bezier(.22,1.0,.36,1.0)';
+      fx.appendChild(b);
     }
-    
-    return payload;
-  } catch (error) {
-    return null;
   }
-}
-
-// ============ API РОУТЫ ============
-
-// 1. Health Check
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
-
-app.get('/api/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ 
-      status: 'ok', 
-      timestamp: new Date().toISOString(),
-      database: 'connected'
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  
+  function haptic(name) {
+    try {
+      if (tg && tg.HapticFeedback) {
+        switch(name) {
+          case 'strong': tg.HapticFeedback.impactOccurred('heavy'); break;
+          case 'confirm': tg.HapticFeedback.notificationOccurred('success'); break;
+          case 'splash': tg.HapticFeedback.impactOccurred('medium'); break;
+          default: tg.HapticFeedback.selectionChanged();
+        }
+      }
+    } catch(e) {}
   }
-});
-
-// 2. Партнеры
-app.get('/api/partners', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM partners WHERE is_active = true ORDER BY name');
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. АВТОРИЗАЦИЯ TELEGRAM (ИСПРАВЛЕННАЯ)
-app.post('/api/auth/telegram', async (req, res) => {
-  try {
-    console.log('🔑 Получен запрос на авторизацию');
-    
-    const { initData } = req.body;
-    
-    if (!initData) {
-      return res.status(400).json({ error: 'Нет данных от Telegram' });
+  
+  // ============ TELEGRAM WEBAPP INTEGRATION ============
+  
+  // Получаем данные Telegram пользователя
+  function getTelegramUserData() {
+    if (!tg) {
+      console.log('⚠️ Не в Telegram WebApp, используем тестовые данные');
+      return {
+        id: Math.floor(Math.random() * 1000000),
+        first_name: 'Тестовый',
+        username: 'testuser' + Date.now(),
+        language_code: 'ru'
+      };
     }
-    
-    let telegramUser;
     
     try {
-      // Парсим данные из Telegram
-      telegramUser = parseTelegramInitData(initData);
-      console.log('✅ Telegram данные получены:', {
-        id: telegramUser.id,
-        name: telegramUser.first_name,
-        username: telegramUser.username
-      });
-    } catch (parseError) {
-      console.error('❌ Ошибка парсинга Telegram данных:', parseError);
-      return res.status(400).json({ 
-        success: false,
-        error: 'Неверные данные Telegram'
-      });
-    }
-    
-    // Проверяем обязательные поля
-    if (!telegramUser.id || !telegramUser.first_name) {
-      return res.status(400).json({
-        success: false,
-        error: 'Отсутствуют обязательные данные пользователя'
-      });
-    }
-    
-    // Находим или создаем пользователя в БД
-    let user;
-    const existingUser = await pool.query(
-      'SELECT * FROM users WHERE telegram_id = $1',
-      [telegramUser.id]
-    );
-    
-    if (existingUser.rows.length > 0) {
-      user = existingUser.rows[0];
-      console.log(`👋 Найден существующий пользователь: ${user.first_name} (ID: ${user.id})`);
+      // Инициализируем WebApp
+      tg.ready();
+      tg.expand();
       
-      // Обновляем информацию о пользователе (если изменилась)
-      await pool.query(
-        `UPDATE users 
-         SET username = $1, first_name = $2, last_name = $3 
-         WHERE telegram_id = $4`,
-        [
-          telegramUser.username || user.username,
-          telegramUser.first_name || user.first_name,
-          telegramUser.last_name || user.last_name,
-          telegramUser.id
-        ]
-      );
+      // Получаем данные пользователя
+      const initData = tg.initData;
+      const user = tg.initDataUnsafe.user;
       
-    } else {
-      // СОЗДАЕМ НОВОГО ПОЛЬЗОВАТЕЛЯ!
-      const newUser = await pool.query(
-        `INSERT INTO users (telegram_id, username, first_name, last_name, language_code) 
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [
-          telegramUser.id,
-          telegramUser.username || '',
-          telegramUser.first_name,
-          telegramUser.last_name || '',
-          telegramUser.language_code || 'ru'
-        ]
-      );
-      user = newUser.rows[0];
-      console.log(`✅ СОЗДАН НОВЫЙ ПОЛЬЗОВАТЕЛЬ: ${user.first_name} (Telegram ID: ${user.telegram_id})`);
+      console.log('📱 Telegram WebApp данные:', {
+        initData: initData?.substring(0, 100) + '...',
+        user: user
+      });
       
-      // Создаем начальную подписку (пустую)
-      const currentMonth = new Date().toISOString().slice(0, 7);
-      await pool.query(
-        `INSERT INTO subscriptions (user_id, cups_remaining, month) 
-         VALUES ($1, $2, $3)`,
-        [user.id, 0, currentMonth]
-      );
-      console.log(`📅 Создана подписка на месяц ${currentMonth}`);
-    }
-    
-    // Генерируем токен
-    const token = generateToken(user.id, user.telegram_id);
-    
-    res.json({
-      success: true,
-      token: token,
-      user: {
-        id: user.id,
-        telegram_id: user.telegram_id,
-        username: user.username,
-        first_name: user.first_name,
-        last_name: user.last_name
+      if (user) {
+        console.log('✅ Telegram пользователь найден:', user.first_name, '(ID:', user.id + ')');
+        return user;
+      } else {
+        console.log('⚠️ Telegram пользователь не найден в initDataUnsafe');
+        
+        // Пробуем получить из initData строки
+        if (initData) {
+          const params = new URLSearchParams(initData);
+          const userStr = params.get('user');
+          if (userStr) {
+            try {
+              const parsedUser = JSON.parse(decodeURIComponent(userStr));
+              console.log('✅ Пользователь из initData:', parsedUser);
+              return parsedUser;
+            } catch(e) {
+              console.error('❌ Ошибка парсинга user из initData:', e);
+            }
+          }
+        }
+        
+        return null;
       }
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка авторизации:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Внутренняя ошибка сервера'
-    });
+      
+    } catch (error) {
+      console.error('❌ Ошибка получения данных Telegram:', error);
+      return null;
+    }
   }
-});
-
-// 4. ПОЛУЧИТЬ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ (ИСПРАВЛЕННОЕ)
-app.get('/api/user/state', async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Нет токена авторизации' });
-    }
-    
-    const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
-    
-    if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
-    }
-    
-    const userId = payload.user_id;
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    
-    // Получаем пользователя
-    const userResult = await pool.query(
-      'SELECT * FROM users WHERE id = $1',
-      [userId]
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-    
-    const user = userResult.rows[0];
-    
-    // Находим подписку текущего месяца (или создаем пустую)
-    let subscriptionResult = await pool.query(
-      `SELECT * FROM subscriptions 
-       WHERE user_id = $1 AND month = $2`,
-      [user.id, currentMonth]
-    );
-    
-    if (subscriptionResult.rows.length === 0) {
-      // Создаем подписку для текущего месяца
-      await pool.query(
-        `INSERT INTO subscriptions (user_id, cups_remaining, month) 
-         VALUES ($1, $2, $3)`,
-        [user.id, 0, currentMonth]
-      );
-      
-      // Получаем созданную подписку
-      subscriptionResult = await pool.query(
-        `SELECT * FROM subscriptions 
-         WHERE user_id = $1 AND month = $2`,
-        [user.id, currentMonth]
-      );
-    }
-    
-    const subscription = subscriptionResult.rows[0];
-    
-    // Получаем партнеров
-    const partnersResult = await pool.query('SELECT * FROM partners WHERE is_active = true');
-    
-    // Получаем историю кодов пользователя (последние 20)
-    const codesResult = await pool.query(
-      `SELECT * FROM codes 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 20`,
-      [user.id]
-    );
-    
-    // Получаем историю платежей
-    const paymentsResult = await pool.query(
-      `SELECT * FROM payments 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 20`,
-      [user.id]
-    );
-    
-    const state = {
-      purchased: subscription.cups_remaining > 0,
-      remaining: subscription.cups_remaining,
-      month: subscription.month,
-      subscription: subscription,
-      partners: partnersResult.rows,
-      codes: codesResult.rows,
-      payments: paymentsResult.rows,
-      user: {
-        id: user.id,
-        telegram_id: user.telegram_id,
-        username: user.username,
-        first_name: user.first_name,
-        last_name: user.last_name
-      }
+  
+  // ============ API INTEGRATION ============
+  
+  async function apiRequest(endpoint, options = {}) {
+    const url = `${API_BASE_URL}${endpoint}`;
+    const headers = {
+      'Content-Type': 'application/json',
+      ...options.headers
     };
     
-    console.log(`📊 Состояние пользователя ${user.first_name}: ${subscription.cups_remaining} чашек`);
-    
-    res.json(state);
-    
-  } catch (error) {
-    console.error('❌ Ошибка получения состояния:', error);
-    res.status(500).json({ error: 'Ошибка получения данных' });
-  }
-});
-
-// 5. ПОКУПКА (ИСПРАВЛЕННАЯ)
-app.post('/api/purchase', async (req, res) => {
-  try {
-    const { cups } = req.body;
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Нет токена авторизации' });
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
     
-    const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
-    
-    if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
-    }
-    
-    const userId = payload.user_id;
-    
-    if (!cups || cups <= 0) {
-      return res.status(400).json({ error: 'Неверное количество чашек' });
-    }
-    
-    console.log(`💰 Покупка ${cups} чашек для пользователя ID: ${userId}`);
-    
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    const pricePerCup = 167;
-    const totalPrice = Math.round(pricePerCup * cups);
-    
-    // Получаем текущую подписку
-    const subscriptionResult = await pool.query(
-      `SELECT * FROM subscriptions 
-       WHERE user_id = $1 AND month = $2`,
-      [userId, currentMonth]
-    );
-    
-    let subscriptionId;
-    let newRemaining;
-    
-    if (subscriptionResult.rows.length > 0) {
-      const subscription = subscriptionResult.rows[0];
-      subscriptionId = subscription.id;
-      newRemaining = subscription.cups_remaining + cups;
+    try {
+      console.log(`📡 API Request: ${endpoint}`);
+      const response = await fetch(url, {
+        ...options,
+        headers
+      });
       
-      // Обновляем существующую подписку
-      await pool.query(
-        `UPDATE subscriptions 
-         SET cups_remaining = $1, 
-             updated_at = NOW(),
-             is_active = true
-         WHERE id = $2`,
-        [newRemaining, subscriptionId]
+      const data = await response.json();
+      
+      if (!response.ok) {
+        console.error(`❌ API Error ${response.status}:`, data);
+        throw new Error(data.error || `API Error ${response.status}`);
+      }
+      
+      console.log(`✅ API Response:`, data);
+      return data;
+      
+    } catch (error) {
+      console.error('❌ API Request Error:', error);
+      throw error;
+    }
+  }
+  
+  // Telegram authentication
+  async function authenticateWithTelegram() {
+    try {
+      console.log('🔑 Начинаем авторизацию...');
+      
+      // Получаем данные пользователя из Telegram
+      const telegramUser = getTelegramUserData();
+      
+      if (!telegramUser) {
+        throw new Error('Не удалось получить данные Telegram');
+      }
+      
+      // Получаем initData от Telegram WebApp
+      let initData = '';
+      if (tg && tg.initData) {
+        initData = tg.initData;
+      } else {
+        // Если нет initData, создаем его из данных пользователя
+        const userData = {
+          id: telegramUser.id,
+          first_name: telegramUser.first_name,
+          username: telegramUser.username || '',
+          language_code: telegramUser.language_code || 'ru'
+        };
+        initData = `user=${encodeURIComponent(JSON.stringify(userData))}&auth_date=${Math.floor(Date.now()/1000)}`;
+      }
+      
+      console.log('📤 Отправляем данные на сервер...');
+      const response = await apiRequest('/api/auth/telegram', {
+        method: 'POST',
+        body: JSON.stringify({ initData })
+      });
+      
+      if (!response.success) {
+        throw new Error(response.error || 'Ошибка авторизации');
+      }
+      
+      token = response.token;
+      user = response.user;
+      
+      console.log(`✅ Авторизован: ${user.first_name} (ID: ${user.id}, Telegram ID: ${user.telegram_id})`);
+      console.log(`🔐 Токен: ${token.substring(0, 30)}...`);
+      
+      // Сохраняем токен в localStorage для восстановления сессии
+      localStorage.setItem('coffeepass_token', token);
+      localStorage.setItem('coffeepass_user', JSON.stringify(user));
+      
+      // Загружаем состояние пользователя
+      await loadUserState();
+      
+      return true;
+      
+    } catch (error) {
+      console.error('❌ Ошибка авторизации:', error);
+      
+      // Пробуем восстановить сессию из localStorage
+      const savedToken = localStorage.getItem('coffeepass_token');
+      const savedUser = localStorage.getItem('coffeepass_user');
+      
+      if (savedToken && savedUser) {
+        console.log('🔄 Восстанавливаем сессию из localStorage...');
+        token = savedToken;
+        user = JSON.parse(savedUser);
+        await loadUserState();
+        return true;
+      }
+      
+      showPopup(
+        `<div style="text-align:center">
+          <h3 style="font-weight:900;margin-bottom:12px">Ошибка авторизации</h3>
+          <p class="small-muted">Попробуйте обновить страницу</p>
+        </div>`, 
+        [{text:'Обновить', cls:'btn primary', cb: ()=>{ location.reload(); }}]
       );
+      return false;
+    }
+  }
+  
+  // Load user state from server
+  async function loadUserState() {
+    try {
+      console.log('🔄 Загружаем состояние пользователя...');
+      const data = await apiRequest('/api/user/state');
+      
+      state = {
+        purchased: data.purchased || false,
+        remaining: data.remaining || 0,
+        month: data.month,
+        subscription: data.subscription,
+        partners: data.partners || []
+      };
+      
+      console.log('✅ Состояние загружено:', {
+        purchased: state.purchased,
+        remaining: state.remaining,
+        month: state.month
+      });
+      
+      // Сохраняем состояние в localStorage для быстрого восстановления
+      localStorage.setItem('coffeepass_state', JSON.stringify(state));
+      
+      renderByState();
+      
+    } catch (error) {
+      console.error('❌ Ошибка загрузки состояния:', error);
+      
+      // Если токен недействителен, пробуем переавторизоваться
+      if (error.message.includes('401') || error.message.includes('токен') || error.message.includes('token')) {
+        console.log('🔄 Токен устарел, пробуем переавторизоваться...');
+        localStorage.removeItem('coffeepass_token');
+        localStorage.removeItem('coffeepass_user');
+        localStorage.removeItem('coffeepass_state');
+        await authenticateWithTelegram();
+      } else {
+        // Используем сохраненное состояние
+        const savedState = localStorage.getItem('coffeepass_state');
+        if (savedState) {
+          console.log('📂 Используем сохраненное состояние из localStorage');
+          state = JSON.parse(savedState);
+          renderByState();
+        }
+      }
+    }
+  }
+  
+  // Process purchase
+  async function processPurchase(count) {
+    try {
+      console.log(`💰 Начинаем покупку ${count} чашек...`);
+      
+      const response = await apiRequest('/api/purchase', {
+        method: 'POST',
+        body: JSON.stringify({ cups: count })
+      });
+      
+      if (response.success) {
+        console.log(`✅ Покупка успешна:`, response);
+        
+        // Обновляем локальное состояние
+        state.purchased = true;
+        state.remaining = response.remaining || (state.remaining + count);
+        if (response.subscription) {
+          state.subscription = response.subscription;
+        }
+        
+        // Сохраняем обновленное состояние
+        localStorage.setItem('coffeepass_state', JSON.stringify(state));
+        
+        haptic('confirm');
+        hidePopup();
+        renderByState();
+        
+        // Показываем успешное сообщение
+        showPopup(
+          `<div style="text-align:center">
+            <div style="font-size:48px;margin-bottom:16px">🎉</div>
+            <div style="font-weight:900;font-size:20px;margin-bottom:12px">Оплачено успешно!</div>
+            <div class="small-muted">
+              Вы добавили <strong>${count}</strong> чашек.<br>
+              Теперь доступно <strong style="color:var(--fg)">${state.remaining} чашек</strong>
+            </div>
+          </div>`, 
+          [{text:'Отлично!', cls:'btn primary', cb: hidePopup}]
+        );
+        
+        return true;
+      }
+      
+    } catch (error) {
+      console.error('❌ Ошибка покупки:', error);
+      
+      showPopup(
+        `<div style="text-align:center">
+          <div style="color:#ff6b6b;font-weight:900;font-size:18px;margin-bottom:12px">Ошибка оплаты</div>
+          <p class="small-muted">${error.message || 'Попробуйте снова'}</p>
+        </div>`, 
+        [{text:'Повторить', cls:'btn primary', cb: () => processPurchase(count)},
+         {text:'Отмена', cls:'btn', cb: hidePopup}]
+      );
+    }
+  }
+  
+  // Generate code for partner
+  async function generateCodeForPartner(partnerName) {
+    try {
+      console.log(`🔐 Генерируем код для партнера: ${partnerName}`);
+      
+      const response = await apiRequest('/api/codes/generate', {
+        method: 'POST',
+        body: JSON.stringify({ partner_name: partnerName })
+      });
+      
+      if (response.success) {
+        console.log(`✅ Код сгенерирован: ${response.code}, осталось: ${response.remaining} чашек`);
+        
+        // Обновляем локальное состояние
+        state.remaining = response.remaining;
+        
+        // Сохраняем обновленное состояние
+        localStorage.setItem('coffeepass_state', JSON.stringify(state));
+        
+        return response.code;
+      }
+      
+    } catch (error) {
+      console.error('❌ Ошибка генерации кода:', error);
+      throw error;
+    }
+  }
+  
+  // Load user history
+  async function loadHistory() {
+    try {
+      const data = await apiRequest('/api/history');
+      return data;
+    } catch (error) {
+      console.error('❌ Ошибка загрузки истории:', error);
+      return { codes: [], payments: [] };
+    }
+  }
+  
+  // ============ UI FUNCTIONS ============
+  
+  function showSplashThenHide() {
+    haptic('splash');
+    
+    if (!splash || !splashLogo) {
+      renderByState();
+      return;
+    }
+    
+    splash.classList.remove('hidden');
+    splash.setAttribute('aria-hidden', 'false');
+    splashLogo.style.transform = 'translateY(8px) scale(.985)';
+    splashLogo.style.opacity = '0.9';
+    
+    setTimeout(() => {
+      splashLogo.style.transform = 'translateY(0) scale(1)';
+      splashLogo.style.opacity = '1';
+    }, 50);
+    
+    setTimeout(() => {
+      splash.classList.add('hidden');
+      splash.setAttribute('aria-hidden', 'true');
+      
+      setTimeout(() => {
+        try {
+          splash.style.display = 'none';
+        } catch(e) {}
+      }, 700);
+    }, 1400);
+  }
+  
+  function renderByState() {
+    const now = new Date();
+    const curMonth = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+    
+    // Month reset logic
+    if (state.month && state.month !== curMonth) {
+      state.purchased = false;
+      state.remaining = 0;
+      state.month = curMonth;
+    }
+    
+    if (state.purchased && state.remaining > 0) {
+      prePurchaseArea.style.display = 'none';
+      postPurchaseArea.style.display = 'flex';
+      usedArea.style.display = 'none';
+      
+      if (cupCountEl) {
+        cupCountEl.style.opacity = '0.5';
+        cupCountEl.textContent = `${state.remaining} чашек`;
+        setTimeout(() => {
+          cupCountEl.style.transition = 'opacity 0.4s cubic-bezier(.22,1.0,.36,1.0)';
+          cupCountEl.style.opacity = '1';
+        }, 50);
+      }
+      
+      if (returnPurchaseBtn) {
+        returnPurchaseBtn.style.display = state.remaining < MAX_CUPS ? '' : 'none';
+      }
+    } else if (state.purchased && state.remaining === 0) {
+      prePurchaseArea.style.display = 'none';
+      postPurchaseArea.style.display = 'none';
+      usedArea.style.display = 'flex';
     } else {
-      // Создаем новую подписку
-      const newSubscription = await pool.query(
-        `INSERT INTO subscriptions (user_id, cups_remaining, month, is_active) 
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [userId, cups, currentMonth, true]
+      prePurchaseArea.style.display = 'flex';
+      postPurchaseArea.style.display = 'none';
+      usedArea.style.display = 'none';
+    }
+  }
+  
+  function formatPrice(x) {
+    return Math.round(x).toLocaleString('ru-RU') + ' ₽';
+  }
+  
+  function openPurchaseDialog() {
+    const remaining = state.remaining || 0;
+    const hasSub = !!state.purchased;
+    const need = Math.max(0, MAX_CUPS - remaining);
+    
+    if (hasSub && remaining > 0) {
+      if (need === 0) {
+        showPopup(
+          `<div style="font-weight:900;font-size:20px">Пропуск заполнен</div>
+          <div class="small-muted" style="margin-top:12px">
+            У вас уже <strong>${remaining}/${MAX_CUPS}</strong> чашек.
+          </div>`, 
+          [{text:'Понятно', cls:'btn primary', cb: hidePopup}]
+        );
+        return;
+      }
+      renderTopUpDialog(1, need, need, need, false);
+    } else {
+      renderTopUpDialog(1, MAX_CUPS, MAX_CUPS, MAX_CUPS, true);
+    }
+  }
+  
+  function renderTopUpDialog(minCount, maxCount, defaultCount, need, isNewSubscription) {
+    const perCup = SUBSCRIPTION_PRICE / MAX_CUPS;
+    const initialPrice = Math.round(perCup * defaultCount);
+    
+    const html = `<div style="font-weight:900;font-size:20px">
+        ${isNewSubscription ? 'Оформить пропуск' : 'Докупить чашки'}
+      </div>
+      <div class="small-muted" style="margin-top:12px">
+        ${isNewSubscription 
+          ? 'Выберите количество чашек для покупки.' 
+          : `Вам не хватает <strong>${need}</strong> чашек до заполнения пропуска.`}
+      </div>
+      
+      <div class="purchase-range" style="margin-top:24px">
+        <input id="cupRange" type="range" min="${minCount}" max="${maxCount}" value="${defaultCount}" />
+        <div class="range-value" id="rangeValue">${defaultCount}</div>
+      </div>
+      
+      <div style="margin-top:20px;text-align:center;padding:16px;background:rgba(255,255,255,0.02);border-radius:12px">
+        <div class="small-muted">Цена за чашку: ${formatPrice(perCup)}</div>
+        <div style="margin-top:8px;font-weight:900;font-size:24px" id="totalPrice">${formatPrice(initialPrice)}</div>
+      </div>`;
+    
+    showPopup(html, [
+      { text: 'Отмена', cls: 'btn', cb: hidePopup },
+      { 
+        text: `Оплатить ${defaultCount} — ${formatPrice(initialPrice)}`, 
+        cls: 'btn primary', 
+        cb: () => { 
+          const cnt = Number(document.getElementById('cupRange').value || defaultCount); 
+          processPurchase(cnt); 
+        }
+      }
+    ]);
+    
+    setTimeout(() => {
+      const range = document.getElementById('cupRange');
+      const valEl = document.getElementById('rangeValue');
+      const priceEl = document.getElementById('totalPrice');
+      
+      if (!range) return;
+      
+      range.addEventListener('input', () => {
+        const v = Number(range.value);
+        valEl.textContent = v;
+        const price = Math.round(perCup * v);
+        priceEl.textContent = formatPrice(price);
+        
+        const payBtn = Array.from(popupActions.querySelectorAll('button'))
+          .find(b => b.classList.contains('primary'));
+        if (payBtn) {
+          payBtn.textContent = `Оплатить ${v} — ${formatPrice(price)}`;
+        }
+      });
+    }, 40);
+  }
+  
+  async function showCodeAndUse() {
+    if (!state.purchased || state.remaining <= 0) {
+      showPopup(
+        `<div style="font-weight:900;font-size:20px">Коды недоступны</div>
+        <div class="small-muted" style="margin-top:12px">
+          У вас нет доступных чашек.
+        </div>`, 
+        [{text:'Купить пропуск', cls:'btn primary', cb: () => {
+          hidePopup();
+          openPurchaseDialog();
+        }}]
       );
-      subscriptionId = newSubscription.rows[0].id;
-      newRemaining = cups;
+      return;
     }
     
-    // СОХРАНЯЕМ ПЛАТЕЖ В БАЗУ
-    const paymentResult = await pool.query(
-      `INSERT INTO payments (user_id, subscription_id, amount, cups_added, status) 
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [userId, subscriptionId, totalPrice, cups, 'completed']
-    );
-    
-    console.log(`✅ Покупка успешна. Платеж ID: ${paymentResult.rows[0].id}`);
-    
-    res.json({
-      success: true,
-      message: `Оплачено ${cups} чашек`,
-      remaining: newRemaining,
-      payment_id: paymentResult.rows[0].id,
-      subscription: {
-        id: subscriptionId,
-        cups_remaining: newRemaining,
-        month: currentMonth
+    let partners = state.partners;
+    if (partners.length === 0) {
+      try {
+        partners = await apiRequest('/api/partners');
+        state.partners = partners;
+      } catch (error) {
+        console.error('Ошибка загрузки партнеров:', error);
+        partners = [
+          { id: 1, name: "Кофейня на Набережной", address: "ул. Набережная, 12" },
+          { id: 2, name: "Teatral Coffee", address: "ул. Театральная, 5" },
+          { id: 3, name: "Горка Кофе", address: "пл. Ворота, 1" },
+          { id: 4, name: "Кофе и Пермь", address: "ул. Ленина, 44" }
+        ];
       }
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка покупки:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 6. Генерация кода (ИСПРАВЛЕННАЯ)
-app.post('/api/codes/generate', async (req, res) => {
-  try {
-    const { partner_name } = req.body;
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Нет токена авторизации' });
     }
     
-    const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
+    const partnerHtml = partners.map(p => `
+      <div class="partner-item" data-name="${p.name}"
+           style="padding:16px;border-radius:12px;border:1px solid rgba(255,255,255,0.05);
+                  margin-bottom:8px;cursor:pointer;transition:all .3s cubic-bezier(.22,1.0,.36,1.0);">
+        <div style="display:flex;justify-content:space-between;align-items:center;width:100%;">
+          <div>
+            <div style="font-weight:900;font-size:16px">${p.name}</div>
+            <div class="small-muted" style="margin-top:4px">${p.description || ''}</div>
+          </div>
+          <div style="font-size:12px;color:var(--muted);text-align:right">
+            ${p.address || ''}
+          </div>
+        </div>
+      </div>
+    `).join('');
     
-    if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
-    }
-    
-    const userId = payload.user_id;
-    const currentMonth = new Date().toISOString().slice(0, 7);
-    
-    // Проверяем, есть ли у пользователя чашки
-    const subscriptionResult = await pool.query(
-      `SELECT cups_remaining FROM subscriptions 
-       WHERE user_id = $1 AND month = $2`,
-      [userId, currentMonth]
+    showPopup(
+      `<div style="font-weight:900;font-size:20px">Выберите партнера</div>
+      <div class="small-muted" style="margin-top:12px">
+        Где будете забирать кофе?
+      </div>
+      <div style="margin-top:20px;max-height:320px;overflow-y:auto;padding-right:8px;">
+        ${partnerHtml}
+      </div>`, 
+      [{text: 'Отмена', cls: 'btn', cb: hidePopup}],
+      { disableClose: false }
     );
     
-    if (subscriptionResult.rows.length === 0 || subscriptionResult.rows[0].cups_remaining <= 0) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Недостаточно чашек для генерации кода' 
+    setTimeout(() => {
+      document.querySelectorAll('.partner-item').forEach(item => {
+        item.addEventListener('click', async () => {
+          const partnerName = item.dataset.name;
+          haptic('confirm');
+          
+          item.style.background = 'rgba(255,255,255,0.05)';
+          item.style.borderColor = 'rgba(255,255,255,0.1)';
+          
+          try {
+            const code = await generateCodeForPartner(partnerName);
+            
+            const html = `<div style="text-align:center">
+              <div style="font-weight:900;font-size:20px">Ваш код</div>
+              <div class="small-muted" style="margin-top:12px">
+                Покажите этот код кассиру в<br>
+                <strong>${partnerName}</strong>
+              </div>
+              
+              <div style="margin-top:24px;padding:24px;background:rgba(255,255,255,0.03);
+                         border-radius:16px;border:1px solid rgba(255,255,255,0.08);">
+                <div style="font-size:48px;font-weight:900;letter-spacing:8px;font-family:'Courier New',monospace;
+                           background:linear-gradient(90deg, #fff, rgba(255,255,255,0.8));
+                           -webkit-background-clip:text;background-clip:text;color:transparent;">
+                  ${code}
+                </div>
+              </div>
+              
+              <div style="margin-top:20px;padding:12px;background:rgba(255,255,255,0.02);
+                         border-radius:12px;border:1px solid rgba(255,255,255,0.05);">
+                <div class="small-muted" style="font-size:12px">
+                  ⚠️ Код одноразовый, осталось ${state.remaining} чашек
+                </div>
+              </div>
+            </div>`;
+            
+            showPopup(html, 
+              [{text: 'Готово', cls: 'btn primary', cb: () => {
+                hidePopup();
+                renderByState();
+                
+                if (cupSvg) {
+                  cupSvg.classList.remove('used-anim');
+                  void cupSvg.offsetWidth;
+                  cupSvg.classList.add('used-anim');
+                  setTimeout(() => haptic('confirm'), 300);
+                }
+              }}], 
+              { disableClose: false }
+            );
+            
+          } catch (error) {
+            console.error('Ошибка генерации кода:', error);
+            showPopup(
+              `<div style="text-align:center">
+                <div style="color:#ff6b6b;font-weight:900;font-size:18px;margin-bottom:12px">Ошибка</div>
+                <p class="small-muted">${error.message || 'Не удалось сгенерировать код'}</p>
+              </div>`, 
+              [{text: 'OK', cls:'btn primary', cb: hidePopup}]
+            );
+          }
+        });
+      });
+    }, 50);
+  }
+  
+  function showPopup(html, actions = [], options = {}) {
+    try {
+      popupContent.innerHTML = html;
+      popupActions.innerHTML = '';
+      
+      actions.forEach(a => {
+        const btn = document.createElement('button');
+        btn.className = a.cls || 'btn';
+        btn.textContent = a.text;
+        btn.style.transition = 'all 0.3s cubic-bezier(.22,1.0,.36,1.0)';
+        
+        btn.onclick = () => {
+          haptic('tap');
+          try {
+            (a.cb || (() => {}))();
+          } catch(e) {
+            console.error(e);
+          }
+        };
+        
+        popupActions.appendChild(btn);
+      });
+      
+      const disableClose = options.disableClose === true;
+      overlay.classList.add('show');
+      overlay.setAttribute('aria-hidden', 'false');
+      
+      if (disableClose) {
+        overlay.dataset.noclose = 'true';
+        popupClose.style.display = 'none';
+      } else {
+        overlay.dataset.noclose = 'false';
+        popupClose.style.display = '';
+      }
+      
+      popup.style.transform = 'translateY(20px) scale(0.98)';
+      popup.style.opacity = '0';
+      
+      setTimeout(() => {
+        popup.style.transition = 'all 0.5s cubic-bezier(.22,1.0,.36,1.0)';
+        popup.style.transform = 'translateY(0) scale(1)';
+        popup.style.opacity = '1';
+      }, 10);
+      
+      const firstBtn = popupActions.querySelector('button');
+      if (firstBtn) {
+        setTimeout(() => firstBtn.focus(), 100);
+      }
+    } catch(e) {
+      console.error('Popup error:', e);
+    }
+  }
+  
+  function hidePopup() {
+    try {
+      popup.style.transform = 'translateY(20px) scale(0.98)';
+      popup.style.opacity = '0';
+      
+      setTimeout(() => {
+        overlay.classList.remove('show');
+        overlay.setAttribute('aria-hidden', 'true');
+        overlay.dataset.noclose = 'false';
+        popupClose.style.display = '';
+        
+        popup.style.transition = 'none';
+        popup.style.transform = '';
+        popup.style.opacity = '';
+      }, 300);
+    } catch(e) {
+      console.error('Hide popup error:', e);
+    }
+  }
+  
+  async function openHistory() {
+    try {
+      const historyData = await loadHistory();
+      
+      const codesRows = (historyData.codes || []).map(h => `
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.05)">
+          <td style="padding:12px 0;color:var(--muted);font-size:13px;width:140px">
+            ${new Date(h.created_at).toLocaleString('ru-RU', {
+              day: '2-digit',
+              month: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit'
+            })}
+          </td>
+          <td style="padding:12px 0;font-weight:900;font-family:'Courier New',monospace">
+            ${h.code}
+          </td>
+          <td style="padding:12px 0;color:${h.is_used ? '#ff6b6b' : '#51cf66'};font-weight:700">
+            ${h.is_used ? 'Использован' : 'Активен'}
+          </td>
+          <td style="padding:12px 0;color:var(--muted);font-size:13px">
+            ${h.partner_name || '—'}
+          </td>
+        </tr>
+      `).join('') || `
+        <tr>
+          <td colspan="4" style="padding:24px;text-align:center;color:var(--muted)">
+            Кодов пока нет
+          </td>
+        </tr>`;
+      
+      const paymentsRows = (historyData.payments || []).map(p => `
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.05)">
+          <td style="padding:12px 0;color:var(--muted);font-size:13px;width:140px">
+            ${new Date(p.created_at).toLocaleString('ru-RU', {
+              day: '2-digit',
+              month: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit'
+            })}
+          </td>
+          <td style="padding:12px 0;font-weight:700">
+            ${p.cups_added} чашек
+          </td>
+          <td style="padding:12px 0;font-weight:900;color:var(--fg)">
+            ${p.amount} ₽
+          </td>
+        </tr>
+      `).join('') || `
+        <tr>
+          <td colspan="3" style="padding:24px;text-align:center;color:var(--muted)">
+            Платежей пока нет
+          </td>
+        </tr>`;
+      
+      const html = `<div style="font-weight:900;font-size:20px">История</div>
+        <div class="small-muted" style="margin-top:12px">
+          Ваши коды и платежи
+        </div>
+        
+        <div style="margin-top:24px">
+          <div style="font-weight:900;font-size:16px;margin-bottom:16px;padding-bottom:8px;
+                     border-bottom:1px solid rgba(255,255,255,0.08)">
+            Коды
+          </div>
+          <div style="max-height:200px;overflow-y:auto">
+            <table style="width:100%;font-size:14px">
+              <thead>
+                <tr style="border-bottom:1px solid rgba(255,255,255,0.1)">
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Время</th>
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Код</th>
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Статус</th>
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Партнер</th>
+                </tr>
+              </thead>
+              <tbody>${codesRows}</tbody>
+            </table>
+          </div>
+        </div>
+        
+        <div style="margin-top:32px">
+          <div style="font-weight:900;font-size:16px;margin-bottom:16px;padding-bottom:8px;
+                     border-bottom:1px solid rgba(255,255,255,0.08)">
+            Платежи
+          </div>
+          <div style="max-height:160px;overflow-y:auto">
+            <table style="width:100%;font-size:14px">
+              <thead>
+                <tr style="border-bottom:1px solid rgba(255,255,255,0.1)">
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Время</th>
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Количество</th>
+                  <th style="text-align:left;padding-bottom:12px;color:var(--muted);font-weight:600">Сумма</th>
+                </tr>
+              </thead>
+              <tbody>${paymentsRows}</tbody>
+            </table>
+          </div>
+        </div>`;
+      
+      showPopup(html, [{text: 'Закрыть', cls: 'btn primary', cb: hidePopup}]);
+    } catch (error) {
+      console.error('Ошибка загрузки истории:', error);
+      showPopup(
+        `<div style="text-align:center">
+          <div style="font-weight:900;font-size:18px;margin-bottom:12px">История</div>
+          <p class="small-muted">${error.message || 'Функция временно недоступна'}</p>
+        </div>`,
+        [{text: 'OK', cls: 'btn primary', cb: hidePopup}]
+      );
+    }
+  }
+  
+  async function initApp() {
+    createBeans();
+    
+    // Инициализируем Telegram WebApp если есть
+    if (tg) {
+      console.log('🤖 Инициализируем Telegram WebApp...');
+      tg.ready();
+      tg.expand();
+      
+      // Устанавливаем тему
+      if (tg.colorScheme === 'dark') {
+        document.documentElement.style.setProperty('--bg', '#070707');
+      }
+      
+      console.log('✅ Telegram WebApp готов');
+      console.log('📱 Платформа:', tg.platform);
+      console.log('👤 Пользователь доступен:', !!tg.initDataUnsafe?.user);
+    }
+    
+    showSplashThenHide();
+    
+    // Авторизуемся
+    await authenticateWithTelegram();
+    
+    // Event listeners
+    if (buyBtn) buyBtn.addEventListener('click', () => { haptic('strong'); openPurchaseDialog(); });
+    if (openCodeBtn) openCodeBtn.addEventListener('click', () => { haptic('confirm'); showCodeAndUse(); });
+    if (historyBtn) historyBtn.addEventListener('click', () => { haptic('tap'); openHistory(); });
+    
+    if (returnPurchaseBtn) {
+      returnPurchaseBtn.addEventListener('click', () => {
+        haptic('tap');
+        prePurchaseArea.style.display = 'flex';
+        postPurchaseArea.style.display = 'none';
+        usedArea.style.display = 'none';
+        
+        prePurchaseArea.style.opacity = '0';
+        prePurchaseArea.style.transform = 'translateY(10px)';
+        setTimeout(() => {
+          prePurchaseArea.style.transition = 'all 0.4s cubic-bezier(.22,1.0,.36,1.0)';
+          prePurchaseArea.style.opacity = '1';
+          prePurchaseArea.style.transform = 'translateY(0)';
+        }, 10);
+        
+        setTimeout(() => { if (buyBtn) buyBtn.focus(); }, 400);
       });
     }
     
-    // Генерируем уникальный код
-    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-    let code;
-    let isUnique = false;
-    
-    while (!isUnique) {
-      code = '';
-      for (let i = 0; i < 6; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
-      }
-      const check = await pool.query('SELECT id FROM codes WHERE code = $1', [code]);
-      isUnique = check.rows.length === 0;
-    }
-    
-    // СОХРАНЯЕМ КОД В БАЗУ
-    const codeResult = await pool.query(
-      `INSERT INTO codes (user_id, code, partner_name) 
-       VALUES ($1, $2, $3) RETURNING *`,
-      [userId, code, partner_name]
-    );
-
-    console.log(`✅ Код сохранен: ${code} для партнера ${partner_name}`);
-    
-    // Уменьшаем счетчик чашек
-    await pool.query(
-      `UPDATE subscriptions 
-       SET cups_remaining = cups_remaining - 1,
-           updated_at = NOW()
-       WHERE user_id = $1 AND month = $2`,
-      [userId, currentMonth]
-    );
-    
-    // Получаем обновленное количество чашек
-    const updatedSubscription = await pool.query(
-      `SELECT cups_remaining FROM subscriptions 
-       WHERE user_id = $1 AND month = $2`,
-      [userId, currentMonth]
-    );
-    
-    res.json({
-      success: true,
-      code: code,
-      remaining: updatedSubscription.rows[0].cups_remaining
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка генерации кода:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 7. История пользователя
-app.get('/api/history', async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Нет токена авторизации' });
-    }
-    
-    const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
-    
-    if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
-    }
-    
-    const userId = payload.user_id;
-    
-    // Получаем коды
-    const codesResult = await pool.query(
-      `SELECT * FROM codes 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 50`,
-      [userId]
-    );
-    
-    // Получаем платежи
-    const paymentsResult = await pool.query(
-      `SELECT * FROM payments 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 50`,
-      [userId]
-    );
-    
-    res.json({
-      codes: codesResult.rows,
-      payments: paymentsResult.rows
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка получения истории:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ ЗАПУСК СЕРВЕРА ============
-async function startServer() {
-  try {
-    await initDatabase();
-    
-    const server = app.listen(PORT, '0.0.0.0', () => {
-      console.log('🚀 Сервер запущен на порту ' + PORT);
-      console.log('🌐 Health: http://0.0.0.0:' + PORT + '/health');
-      console.log('📊 API готов к работе!');
-    });
-    
-    // Graceful shutdown
-    process.on('SIGTERM', () => {
-      console.log('🛑 Получен SIGTERM');
-      server.close(() => {
-        console.log('✅ Сервер остановлен');
-        process.exit(0);
+    if (buyAgainBtn) {
+      buyAgainBtn.addEventListener('click', () => {
+        haptic('tap');
+        prePurchaseArea.style.display = 'flex';
+        postPurchaseArea.style.display = 'none';
+        usedArea.style.display = 'none';
+        
+        prePurchaseArea.style.opacity = '0';
+        prePurchaseArea.style.transform = 'translateY(10px)';
+        setTimeout(() => {
+          prePurchaseArea.style.transition = 'all 0.4s cubic-bezier(.22,1.0,.36,1.0)';
+          prePurchaseArea.style.opacity = '1';
+          prePurchaseArea.style.transform = 'translateY(0)';
+        }, 10);
+        
+        setTimeout(() => { if (buyBtn) buyBtn.focus(); }, 400);
       });
+    }
+    
+    if (partnersBtn) {
+      partnersBtn.addEventListener('click', () => {
+        haptic('tap');
+        const open = partnersList.classList.toggle('open');
+        partnersBtn.setAttribute('aria-pressed', open ? 'true' : 'false');
+        partnersList.setAttribute('aria-hidden', open ? 'false' : 'true');
+      });
+    }
+    
+    if (partnersPanel) {
+      partnersPanel.addEventListener('click', (e) => {
+        const item = e.target.closest('.partner-item');
+        if (!item) return;
+        haptic('tap');
+        const name = item.dataset.name;
+        
+        showPopup(
+          `<div style="font-weight:900;font-size:20px">${name}</div>
+          <div class="small-muted" style="margin-top:12px">
+            ${item.querySelector('small').textContent}
+          </div>
+          <div style="margin-top:16px;padding:12px;background:rgba(255,255,255,0.02);
+                     border-radius:12px;border:1px solid rgba(255,255,255,0.05);">
+            <div style="color:var(--fg);font-weight:600">Адрес:</div>
+            <div style="margin-top:4px;color:var(--muted)">
+              ${item.querySelector('div[style*="font-size:12px"]').textContent}
+            </div>
+          </div>`, 
+          [{text:'Ок', cls:'btn primary', cb: hidePopup}]
+        );
+      });
+    }
+    
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('#partnersBtn') && !e.target.closest('#partnersList')) {
+        partnersList.classList.remove('open');
+        partnersList.setAttribute('aria-hidden', 'true');
+        partnersBtn.setAttribute('aria-pressed', 'false');
+      }
     });
     
-  } catch (error) {
-    console.error('❌ Ошибка запуска:', error);
-    process.exit(1);
+    if (popupClose) popupClose.addEventListener('click', () => { haptic('tap'); hidePopup(); });
+    
+    if (overlay) {
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay && overlay.dataset.noclose !== 'true') {
+          haptic('tap');
+          hidePopup();
+        }
+      });
+    }
+    
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && overlay.classList.contains('show')) {
+        if (overlay.dataset.noclose !== 'true') hidePopup();
+      }
+      if (e.key === 'Escape' && partnersList.classList.contains('open')) {
+        partnersList.classList.remove('open');
+        partnersList.setAttribute('aria-hidden', 'true');
+        partnersBtn.setAttribute('aria-pressed', 'false');
+      }
+    });
+    
+    console.log('✅ CoffeePass полностью инициализирован');
+    console.log(`🌐 API: ${API_BASE_URL}`);
+    console.log(`👤 Пользователь: ${user ? user.first_name : 'не авторизован'}`);
+    console.log(`💰 Состояние: ${state.remaining} чашек, purchased: ${state.purchased}`);
   }
-}
-
-startServer();
+  
+  setTimeout(() => {
+    initApp();
+  }, 100);
+  
+})();
+</script>
