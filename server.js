@@ -421,7 +421,7 @@ app.post('/api/create-payment', async (req, res) => {
     const payment = paymentResult.rows[0];
     
     // ВАЖНО: ВСТАВЬТЕ ВАШУ ССЫЛКУ TBank ЗДЕСЬ!
-    const tbankUrl = `https://tbank.ru/cf/ВАША_ССЫЛКА?payment_id=${payment.id}&amount=${totalAmount}&cups=${cups}`;
+    const tbankUrl = `${payment.id}&amount=${totalAmount}&cups=${cups}`;
     
     res.json({
       success: true,
@@ -671,3 +671,4 @@ async function startServer() {
 }
 
 startServer();
+
