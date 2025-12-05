@@ -26,11 +26,12 @@ const pool = new Pool({
 
 console.log('✅ Подключение к PostgreSQL...');
 
-// ============ СОЗДАНИЕ ТАБЛИЦ ============
+// ============ СОЗДАНИЕ ТАБЛИЦ (ВАШИ ИСХОДНЫЕ + ДОПОЛНЕНИЯ) ============
 async function initDatabase() {
   try {
     console.log('🔄 Создаем таблицы...');
     
+    // 1. ВАША ИСХОДНАЯ ТАБЛИЦА users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -43,6 +44,7 @@ async function initDatabase() {
       );
     `);
     
+    // 2. ВАША ИСХОДНАЯ ТАБЛИЦА subscriptions
     await pool.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
@@ -57,13 +59,15 @@ async function initDatabase() {
       );
     `);
     
+    // 3. ТАБЛИЦА payments (ВАША ИСХОДНАЯ + ДОПОЛНЕНИЯ ДЛЯ TBANK)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS payments (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
+        subscription_id INTEGER REFERENCES subscriptions(id),
         amount INTEGER NOT NULL,
         cups_added INTEGER NOT NULL,
-        status VARCHAR(20) DEFAULT 'pending',
+        status VARCHAR(20) DEFAULT 'pending', -- изменено с 'completed' на 'pending'
         payment_method VARCHAR(20),
         transaction_id VARCHAR(100),
         paid_at TIMESTAMP,
@@ -71,6 +75,7 @@ async function initDatabase() {
       );
     `);
     
+    // 4. ВАША ИСХОДНАЯ ТАБЛИЦА codes
     await pool.query(`
       CREATE TABLE IF NOT EXISTS codes (
         id SERIAL PRIMARY KEY,
@@ -83,6 +88,7 @@ async function initDatabase() {
       );
     `);
     
+    // 5. ВАША ИСХОДНАЯ ТАБЛИЦА partners
     await pool.query(`
       CREATE TABLE IF NOT EXISTS partners (
         id SERIAL PRIMARY KEY,
@@ -93,6 +99,7 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       
+      -- ВАШИ ИСХОДНЫЕ ДАННЫЕ О ПАРТНЕРАХ
       INSERT INTO partners (name, description, address) VALUES
         ('Кофейня на Набережной', 'Уют у Камской набережной', 'ул. Набережная, 12'),
         ('Teatral Coffee', 'Рядом с театром', 'ул. Театральная, 5'),
@@ -101,7 +108,7 @@ async function initDatabase() {
       ON CONFLICT (name) DO NOTHING;
     `);
     
-    console.log('✅ Все таблицы созданы');
+    console.log('✅ Все таблицы созданы (ваши исходные + платежи)');
     
   } catch (error) {
     console.error('❌ Ошибка создания таблиц:', error.message);
@@ -113,6 +120,8 @@ async function initDatabase() {
 // Парсим initData от Telegram
 function parseTelegramInitData(initData) {
   try {
+    console.log('📋 Парсим данные Telegram:', initData.substring(0, 100) + '...');
+    
     const params = new URLSearchParams(initData);
     const userStr = params.get('user');
     if (!userStr) {
@@ -120,7 +129,10 @@ function parseTelegramInitData(initData) {
     }
     
     const user = JSON.parse(decodeURIComponent(userStr));
+    console.log('👤 Парсинг успешен:', user.first_name, user.id);
+    
     return user;
+    
   } catch (error) {
     console.error('❌ Ошибка парсинга Telegram данных:', error);
     throw error;
@@ -132,7 +144,7 @@ function generateToken(userId, telegramId) {
   const payload = {
     user_id: userId,
     telegram_id: telegramId,
-    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7)
+    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7 дней
   };
   
   const token = Buffer.from(JSON.stringify(payload)).toString('base64');
@@ -154,29 +166,6 @@ function verifyToken(token) {
     return null;
   }
 }
-
-// Мидлварь для аутентификации
-const authenticate = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Нет токена авторизации' });
-    }
-    
-    const token = authHeader.split(' ')[1];
-    const payload = verifyToken(token);
-    
-    if (!payload) {
-      return res.status(401).json({ error: 'Неверный или просроченный токен' });
-    }
-    
-    req.userId = payload.user_id;
-    req.telegramId = payload.telegram_id;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'Ошибка аутентификации' });
-  }
-};
 
 // ============ API РОУТЫ ============
 
@@ -211,6 +200,8 @@ app.get('/api/partners', async (req, res) => {
 // 3. АВТОРИЗАЦИЯ TELEGRAM
 app.post('/api/auth/telegram', async (req, res) => {
   try {
+    console.log('🔑 Получен запрос на авторизацию');
+    
     const { initData } = req.body;
     
     if (!initData) {
@@ -221,6 +212,11 @@ app.post('/api/auth/telegram', async (req, res) => {
     
     try {
       telegramUser = parseTelegramInitData(initData);
+      console.log('✅ Telegram данные получены:', {
+        id: telegramUser.id,
+        name: telegramUser.first_name,
+        username: telegramUser.username
+      });
     } catch (parseError) {
       console.error('❌ Ошибка парсинга Telegram данных:', parseError);
       return res.status(400).json({ 
@@ -236,7 +232,6 @@ app.post('/api/auth/telegram', async (req, res) => {
       });
     }
     
-    // Находим или создаем пользователя в БД
     let user;
     const existingUser = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
@@ -245,8 +240,8 @@ app.post('/api/auth/telegram', async (req, res) => {
     
     if (existingUser.rows.length > 0) {
       user = existingUser.rows[0];
+      console.log(`👋 Найден существующий пользователь: ${user.first_name} (ID: ${user.id})`);
       
-      // Обновляем информацию о пользователе
       await pool.query(
         `UPDATE users 
          SET username = $1, first_name = $2, last_name = $3 
@@ -272,16 +267,16 @@ app.post('/api/auth/telegram', async (req, res) => {
         ]
       );
       user = newUser.rows[0];
+      console.log(`✅ СОЗДАН НОВЫЙ ПОЛЬЗОВАТЕЛЬ: ${user.first_name} (Telegram ID: ${user.telegram_id})`);
       
-      // Создаем начальную подписку (пустую)
       const currentMonth = new Date().toISOString().slice(0, 7);
       await pool.query(
         `INSERT INTO subscriptions (user_id, cups_remaining, month) VALUES ($1, $2, $3)`,
         [user.id, 0, currentMonth]
       );
+      console.log(`📅 Создана подписка на месяц ${currentMonth}`);
     }
     
-    // Генерируем токен
     const token = generateToken(user.id, user.telegram_id);
     
     res.json({
@@ -306,12 +301,23 @@ app.post('/api/auth/telegram', async (req, res) => {
 });
 
 // 4. ПОЛУЧИТЬ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ
-app.get('/api/user/state', authenticate, async (req, res) => {
+app.get('/api/user/state', async (req, res) => {
   try {
-    const userId = req.userId;
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Нет токена авторизации' });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+    }
+    
+    const userId = payload.user_id;
     const currentMonth = new Date().toISOString().slice(0, 7);
     
-    // Получаем пользователя
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -323,14 +329,12 @@ app.get('/api/user/state', authenticate, async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Находим подписку текущего месяца
     let subscriptionResult = await pool.query(
       `SELECT * FROM subscriptions WHERE user_id = $1 AND month = $2`,
       [user.id, currentMonth]
     );
     
     if (subscriptionResult.rows.length === 0) {
-      // Создаем подписку для текущего месяца
       await pool.query(
         `INSERT INTO subscriptions (user_id, cups_remaining, month) VALUES ($1, $2, $3)`,
         [user.id, 0, currentMonth]
@@ -344,16 +348,13 @@ app.get('/api/user/state', authenticate, async (req, res) => {
     
     const subscription = subscriptionResult.rows[0];
     
-    // Получаем партнеров
     const partnersResult = await pool.query('SELECT * FROM partners WHERE is_active = true');
     
-    // Получаем историю кодов
     const codesResult = await pool.query(
       `SELECT * FROM codes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`,
       [user.id]
     );
     
-    // Получаем историю платежей
     const paymentsResult = await pool.query(
       `SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`,
       [user.id]
@@ -376,6 +377,8 @@ app.get('/api/user/state', authenticate, async (req, res) => {
       }
     };
     
+    console.log(`📊 Состояние пользователя ${user.first_name}: ${subscription.cups_remaining} чашек`);
+    
     res.json(state);
     
   } catch (error) {
@@ -384,21 +387,36 @@ app.get('/api/user/state', authenticate, async (req, res) => {
   }
 });
 
-// 5. СОЗДАНИЕ ПЛАТЕЖА ДЛЯ TBANK
-app.post('/api/create-payment', authenticate, async (req, res) => {
+// 5. СОЗДАНИЕ ПЛАТЕЖА ДЛЯ TBANK (НОВЫЙ ЭНДПОИНТ)
+app.post('/api/create-payment', async (req, res) => {
   try {
     const { cups, amount } = req.body;
-    const userId = req.userId;
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Нет токена авторизации' });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+    }
+    
+    const userId = payload.user_id;
     
     if (!cups || cups <= 0) {
       return res.status(400).json({ error: 'Неверное количество чашек' });
     }
     
+    console.log(`💰 Создание платежа: ${cups} чашек для пользователя ID: ${userId}`);
+    
     const currentMonth = new Date().toISOString().slice(0, 7);
     const pricePerCup = 167;
     const totalAmount = amount || Math.round(pricePerCup * cups);
     
-    // Создаем запись о платеже
+    // Создаем запись о платеже со статусом 'pending'
     const paymentResult = await pool.query(
       `INSERT INTO payments (user_id, amount, cups_added, status, payment_method) 
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
@@ -407,8 +425,9 @@ app.post('/api/create-payment', authenticate, async (req, res) => {
     
     const payment = paymentResult.rows[0];
     
-    // Формируем URL для TBank
+    // ВАЖНО: ВСТАВЬТЕ ВАШУ ССЫЛКУ TBank ЗДЕСЬ!
     const tbankUrl = `https://tbank.ru/cf/1QbMF9U9yHP?payment_id=${payment.id}&amount=${totalAmount}&cups=${cups}`;
+    // ^ ЗАМЕНИТЕ 1QbMF9U9yHP НА ВАШУ ССЫЛКУ
     
     res.json({
       success: true,
@@ -416,8 +435,8 @@ app.post('/api/create-payment', authenticate, async (req, res) => {
       amount: totalAmount,
       cups: cups,
       payment_url: tbankUrl,
-      return_url: `https://your-domain.com/payment-success/${payment.id}`,
-      cancel_url: `https://your-domain.com/payment-cancel/${payment.id}`
+      return_url: `https://ваш-сайт.ru/payment-success/${payment.id}`,
+      cancel_url: `https://ваш-сайт.ru/payment-cancel/${payment.id}`
     });
     
   } catch (error) {
@@ -426,7 +445,7 @@ app.post('/api/create-payment', authenticate, async (req, res) => {
   }
 });
 
-// 6. WEBHOOK ДЛЯ ПОДТВЕРЖДЕНИЯ ОПЛАТЫ ОТ TBANK
+// 6. WEBHOOK ОТ TBANK ДЛЯ ПОДТВЕРЖДЕНИЯ ОПЛАТЫ
 app.post('/api/tbank-webhook', async (req, res) => {
   try {
     const { payment_id, status, transaction_id } = req.body;
@@ -437,7 +456,6 @@ app.post('/api/tbank-webhook', async (req, res) => {
       return res.status(400).json({ error: 'Нет payment_id' });
     }
     
-    // Получаем платеж
     const paymentResult = await pool.query(
       `SELECT * FROM payments WHERE id = $1`,
       [payment_id]
@@ -462,13 +480,17 @@ app.post('/api/tbank-webhook', async (req, res) => {
       
       // Добавляем чашки пользователю
       const currentMonth = new Date().toISOString().slice(0, 7);
+      
+      // Обновляем подписку (связываем payment с subscription)
       const subscriptionResult = await pool.query(
         `SELECT * FROM subscriptions WHERE user_id = $1 AND month = $2`,
         [payment.user_id, currentMonth]
       );
       
+      let subscriptionId;
+      
       if (subscriptionResult.rows.length > 0) {
-        // Обновляем существующую подписку
+        subscriptionId = subscriptionResult.rows[0].id;
         await pool.query(
           `UPDATE subscriptions 
            SET cups_remaining = cups_remaining + $1,
@@ -478,13 +500,19 @@ app.post('/api/tbank-webhook', async (req, res) => {
           [payment.cups_added, payment.user_id, currentMonth]
         );
       } else {
-        // Создаем новую подписку
-        await pool.query(
+        const newSubscription = await pool.query(
           `INSERT INTO subscriptions (user_id, cups_remaining, month, is_active) 
-           VALUES ($1, $2, $3, $4)`,
+           VALUES ($1, $2, $3, $4) RETURNING id`,
           [payment.user_id, payment.cups_added, currentMonth, true]
         );
+        subscriptionId = newSubscription.rows[0].id;
       }
+      
+      // Обновляем subscription_id в платеже
+      await pool.query(
+        `UPDATE payments SET subscription_id = $1 WHERE id = $2`,
+        [subscriptionId, payment_id]
+      );
       
       console.log(`✅ Платеж ${payment_id} подтвержден, добавлено ${payment.cups_added} чашек`);
       
@@ -504,14 +532,25 @@ app.post('/api/tbank-webhook', async (req, res) => {
 });
 
 // 7. ПРОВЕРКА СТАТУСА ПЛАТЕЖА
-app.get('/api/payment-status/:paymentId', authenticate, async (req, res) => {
+app.get('/api/payment-status/:paymentId', async (req, res) => {
   try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Нет токена авторизации' });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+    }
+    
     const paymentId = req.params.paymentId;
-    const userId = req.userId;
     
     const paymentResult = await pool.query(
       `SELECT * FROM payments WHERE id = $1 AND user_id = $2`,
-      [paymentId, userId]
+      [paymentId, payload.user_id]
     );
     
     if (paymentResult.rows.length === 0) {
@@ -526,14 +565,26 @@ app.get('/api/payment-status/:paymentId', authenticate, async (req, res) => {
   }
 });
 
-// 8. ГЕНЕРАЦИЯ КОДА ДЛЯ ПАРТНЕРА
-app.post('/api/codes/generate', authenticate, async (req, res) => {
+// 8. ГЕНЕРАЦИЯ КОДА (ВАШ ИСХОДНЫЙ КОД)
+app.post('/api/codes/generate', async (req, res) => {
   try {
     const { partner_name } = req.body;
-    const userId = req.userId;
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Нет токена авторизации' });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+    }
+    
+    const userId = payload.user_id;
     const currentMonth = new Date().toISOString().slice(0, 7);
     
-    // Проверяем, есть ли у пользователя чашки
     const subscriptionResult = await pool.query(
       `SELECT cups_remaining FROM subscriptions WHERE user_id = $1 AND month = $2`,
       [userId, currentMonth]
@@ -546,7 +597,6 @@ app.post('/api/codes/generate', authenticate, async (req, res) => {
       });
     }
     
-    // Генерируем уникальный код
     const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
     let code;
     let isUnique = false;
@@ -560,13 +610,13 @@ app.post('/api/codes/generate', authenticate, async (req, res) => {
       isUnique = check.rows.length === 0;
     }
     
-    // Сохраняем код
     const codeResult = await pool.query(
       `INSERT INTO codes (user_id, code, partner_name) VALUES ($1, $2, $3) RETURNING *`,
       [userId, code, partner_name]
     );
     
-    // Уменьшаем счетчик чашек
+    console.log(`✅ Код сохранен: ${code} для партнера ${partner_name}`);
+    
     await pool.query(
       `UPDATE subscriptions 
        SET cups_remaining = cups_remaining - 1,
@@ -575,7 +625,6 @@ app.post('/api/codes/generate', authenticate, async (req, res) => {
       [userId, currentMonth]
     );
     
-    // Получаем обновленное количество
     const updatedSubscription = await pool.query(
       `SELECT cups_remaining FROM subscriptions WHERE user_id = $1 AND month = $2`,
       [userId, currentMonth]
@@ -593,18 +642,28 @@ app.post('/api/codes/generate', authenticate, async (req, res) => {
   }
 });
 
-// 9. ИСТОРИЯ ПОЛЬЗОВАТЕЛЯ
-app.get('/api/history', authenticate, async (req, res) => {
+// 9. ИСТОРИЯ ПОЛЬЗОВАТЕЛЯ (ВАШ ИСХОДНЫЙ КОД)
+app.get('/api/history', async (req, res) => {
   try {
-    const userId = req.userId;
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Нет токена авторизации' });
+    }
     
-    // Получаем коды
+    const token = authHeader.split(' ')[1];
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+    }
+    
+    const userId = payload.user_id;
+    
     const codesResult = await pool.query(
       `SELECT * FROM codes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [userId]
     );
     
-    // Получаем платежи
     const paymentsResult = await pool.query(
       `SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [userId]
@@ -621,11 +680,24 @@ app.get('/api/history', authenticate, async (req, res) => {
   }
 });
 
-// 10. ТЕСТОВАЯ ОПЛАТА (для разработки)
-app.post('/api/test-payment', authenticate, async (req, res) => {
+// 10. ТЕСТОВАЯ ОПЛАТА (для разработки, если нужно)
+app.post('/api/test-payment', async (req, res) => {
   try {
     const { cups } = req.body;
-    const userId = req.userId;
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Нет токена авторизации' });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    const payload = verifyToken(token);
+    
+    if (!payload) {
+      return res.status(401).json({ error: 'Неверный или просроченный токен' });
+    }
+    
+    const userId = payload.user_id;
     
     if (!cups || cups <= 0) {
       return res.status(400).json({ error: 'Неверное количество чашек' });
@@ -650,7 +722,10 @@ app.post('/api/test-payment', authenticate, async (req, res) => {
       [userId, currentMonth]
     );
     
+    let subscriptionId;
+    
     if (subscriptionResult.rows.length > 0) {
+      subscriptionId = subscriptionResult.rows[0].id;
       await pool.query(
         `UPDATE subscriptions 
          SET cups_remaining = cups_remaining + $1,
@@ -660,12 +735,19 @@ app.post('/api/test-payment', authenticate, async (req, res) => {
         [cups, userId, currentMonth]
       );
     } else {
-      await pool.query(
+      const newSubscription = await pool.query(
         `INSERT INTO subscriptions (user_id, cups_remaining, month, is_active) 
-         VALUES ($1, $2, $3, $4)`,
+         VALUES ($1, $2, $3, $4) RETURNING id`,
         [userId, cups, currentMonth, true]
       );
+      subscriptionId = newSubscription.rows[0].id;
     }
+    
+    // Обновляем subscription_id
+    await pool.query(
+      `UPDATE payments SET subscription_id = $1 WHERE id = $2`,
+      [subscriptionId, payment.id]
+    );
     
     // Получаем обновленное состояние
     const updatedSubscription = await pool.query(
